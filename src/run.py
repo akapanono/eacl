@@ -204,9 +204,9 @@ if __name__ == '__main__':
             format(e + 1, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc,
             test_fscore, round(time.time() - start_time, 2)))
 
-        if test_fscore > best_test_fscore:
+        if valid_fscore > best_test_fscore:
             best_model = copy.deepcopy(model)
-            best_test_fscore = test_fscore
+            best_test_fscore = valid_fscore
             torch.save(model.state_dict(), path + args.dataset_name + '/model_' + '.pkl')
 
     logger.info('finish stage 1 training!')
