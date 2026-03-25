@@ -145,13 +145,16 @@ if __name__ == '__main__':
         print('Running on CPU')
 
     logger = get_logger(path + args.dataset_name + '/logging.log')
-    logger.info('start training on GPU {}!'.format(os.environ["CUDA_VISIBLE_DEVICES"]))
+    if args.cuda:
+        logger.info('start training on GPU {}!'.format(os.environ.get("CUDA_VISIBLE_DEVICES", "default")))
+    else:
+        logger.info('start training on CPU!')
     logger.info(args)
 
     cuda = args.cuda
     n_epochs = args.epochs
     batch_size = args.batch_size
-    tokenizer = AutoTokenizer.from_pretrained(args.bert_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.bert_path, local_files_only=True)
     tokenizer.add_tokens("<mask>")
     if args.dataset_name == "IEMOCAP":
         n_classes = 6

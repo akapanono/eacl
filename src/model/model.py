@@ -11,7 +11,7 @@ class CLModel(nn.Module):
         self.num_classes = n_classes
         self.pad_value = args.pad_value
         self.mask_value = 50265
-        self.f_context_encoder = AutoModel.from_pretrained(args.bert_path)
+        self.f_context_encoder = AutoModel.from_pretrained(args.bert_path, local_files_only=True)
         
         num_embeddings, self.dim = self.f_context_encoder.embeddings.word_embeddings.weight.data.shape
         self.avg_dist = []

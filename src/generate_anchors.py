@@ -18,9 +18,9 @@ def get_parser():
 if __name__ == "__main__":
     args = get_parser()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.bert_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.bert_path, local_files_only=True)
 
-    model = AutoModel.from_pretrained(args.bert_path)
+    model = AutoModel.from_pretrained(args.bert_path, local_files_only=True)
     model.eval()
     save_path = args.bert_path.split("/")[-1]
     iemocap_emos = [
