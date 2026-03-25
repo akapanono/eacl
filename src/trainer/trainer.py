@@ -118,7 +118,7 @@ def _forward(model, loss_function, input_orig, input_aug, label, device):
     return loss, loss_output, log_prob, label[mask], mask, anchor_scores
 
 def retrain(model, loss_function, dataloader, epoch, device, args, optimizer=None, lr_scheduler=None, train=False):
-    losses, ce_losses, preds, labels = [], [], [], [], []
+    losses, ce_losses, preds, labels = [], [], [], []
     
     for batch in dataloader:
         data, label = batch
@@ -127,9 +127,12 @@ def retrain(model, loss_function, dataloader, epoch, device, args, optimizer=Non
         if args.fp16:
             with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
                 log_prob = model(data) 
+        else:
+            log_prob = model(data)
         
         loss = loss_function(log_prob, label)
         losses.append(loss.item())
+        ce_losses.append(loss.item())
         pred = torch.argmax(log_prob, dim = -1)
         preds.append(pred)
         labels.append(label)
