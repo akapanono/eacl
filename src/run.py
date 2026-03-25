@@ -93,6 +93,7 @@ def get_parser():
     parser.add_argument("--temp", type=float, default=0.5)
     parser.add_argument('--accumulation_step', type=int, default=1)
     parser.add_argument('--no_cuda', action='store_true', default=False, help='does not use GPU')
+    parser.add_argument('--gpu_id', type=int, default=1, help='GPU id to use when CUDA is available')
 
     parser.add_argument('--dataset_name', default='IEMOCAP', type= str, help='dataset name, IEMOCAP or MELD or EmoryNLP')
 
@@ -104,7 +105,7 @@ def get_parser():
 
     parser.add_argument('--dropout', type=float, default=0.1, metavar='dropout', help='dropout rate')
 
-    parser.add_argument('--batch_size', type=int, default=64, metavar='BS', help='batch size')
+    parser.add_argument('--batch_size', type=int, default=8, metavar='BS', help='batch size')
 
     parser.add_argument('--epochs', type=int, default=8, metavar='E', help='number of epochs')
 
@@ -115,6 +116,8 @@ def get_parser():
     parser.add_argument("--ignore_prompt_prefix", action="store_true", default=True)
     parser.add_argument("--disable_training_progress_bar", action="store_true")
     parser.add_argument("--mapping_lower_dim", type=int, default=1024)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
 
     # ablation study
     parser.add_argument("--disable_emo_anchor", action='store_true')
@@ -138,6 +141,8 @@ if __name__ == '__main__':
     os.makedirs(os.path.join(path, args.dataset_name), exist_ok=True)
     seed_everything(args.seed)
     args.cuda = torch.cuda.is_available() and not args.no_cuda
+    if args.cuda:
+        torch.cuda.set_device(args.gpu_id)
     
     if args.cuda:
         print('Running on GPU')
@@ -146,7 +151,7 @@ if __name__ == '__main__':
 
     logger = get_logger(path + args.dataset_name + '/logging.log')
     if args.cuda:
-        logger.info('start training on GPU {}!'.format(os.environ.get("CUDA_VISIBLE_DEVICES", "default")))
+        logger.info('start training on GPU {}!'.format(args.gpu_id))
     else:
         logger.info('start training on CPU!')
     logger.info(args)
@@ -170,13 +175,15 @@ if __name__ == '__main__':
         trainset
     )
     
-    train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, pin_memory=True, sampler=sampler, num_workers=8)
-    valid_loader = DataLoader(devset, batch_size=args.batch_size, shuffle=False, num_workers=8)
-    test_loader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=8)
+    train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, pin_memory=True, sampler=sampler, num_workers=args.num_workers)
+    valid_loader = DataLoader(devset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    test_loader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     print('building model..')
     model = CLModel(args, n_classes, tokenizer)
-    model = model.cuda()
-    device = "cuda"
+    if args.gradient_checkpointing and hasattr(model.f_context_encoder, "gradient_checkpointing_enable"):
+        model.f_context_encoder.gradient_checkpointing_enable()
+    device = f"cuda:{args.gpu_id}" if args.cuda else "cpu"
+    model = model.to(device)
     # loss_function = FocalLoss(alpha=0.75).to(device)
     num_training_steps = 1
     num_warmup_steps = 0
@@ -281,9 +288,9 @@ if __name__ == '__main__':
         trainset = TensorDataset(emb_train, label_train)
         validset = TensorDataset(emb_val, label_val)
         testset = TensorDataset(emb_test, label_test)
-        train_loader = DataLoader(trainset, batch_size=64, shuffle=False, pin_memory=True, sampler=sampler, num_workers=8)
-        valid_loader = DataLoader(validset, batch_size=64, shuffle=False, num_workers=8)
-        test_loader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=8)
+        train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, pin_memory=True, sampler=sampler, num_workers=args.num_workers)
+        valid_loader = DataLoader(validset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+        test_loader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
         if args.save_stage_two_cache:
             os.makedirs("cache", exist_ok=True)
             pickle.dump([train_loader, valid_loader, test_loader, anchors], open(f"./cache/{args.dataset_name}.pkl", 'wb'))

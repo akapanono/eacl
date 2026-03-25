@@ -18,7 +18,7 @@ class CLModel(nn.Module):
 
         self.f_context_encoder.resize_token_embeddings(num_embeddings + 256)
         self.eps = 1e-8
-        self.device = "cuda" if self.args.cuda else "cpu"
+        self.device = f"cuda:{self.args.gpu_id}" if self.args.cuda else "cpu"
         self.predictor = nn.Sequential(
             # nn.Linear(self.dim, self.dim),
             # nn.ReLU(),
