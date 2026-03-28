@@ -14,11 +14,13 @@ class HybridLossOutput:
     anchortype_labels:torch.Tensor = None
     max_cosine:torch.Tensor = None
 
-def loss_function(log_prob, reps, label, mask, model):
+def loss_function(log_prob, reps, raw_reps, label, mask, model):
     ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-1).to(reps.device)
     scl_loss_fn = SupConLoss(model.args)
     cl_loss = scl_loss_fn(reps, label, model, return_representations=not model.training)
     ce_loss = ce_loss_fn(log_prob[mask], label[mask])
+    if model.training:
+        model.update_anchors(raw_reps, label)
     return HybridLossOutput(
         ce_loss=ce_loss,
         cl_loss=cl_loss.loss,
@@ -55,30 +57,21 @@ class SupConLoss(nn.Module):
         super().__init__()
         self.temperature = args.temp
         self.eps = 1e-8
-        if args.dataset_name == "IEMOCAP":
-            self.emo_anchor = torch.load(f"{args.anchor_path}/iemocap_emo.pt")
-            self.emo_label = torch.tensor([0, 1, 2, 3, 4, 5])
-        elif args.dataset_name == "MELD":
-            self.emo_anchor = torch.load(f"{args.anchor_path}/meld_emo.pt")
-            self.emo_label = torch.tensor([0, 1, 2, 3, 4, 5, 6])
-        elif args.dataset_name == "EmoryNLP":
-            self.emo_anchor = torch.load(f"{args.anchor_path}/emorynlp_emo.pt")
-            self.emo_label = torch.tensor([0, 1, 2, 3, 4, 5, 6])
-        self.sim = nn.functional.cosine_similarity(self.emo_anchor.unsqueeze(1), self.emo_anchor.unsqueeze(0), dim=2)
         self.args = args
+
     def score_func(self, x, y):
         return (1 + F.cosine_similarity(x, y, dim=-1))/2 + self.eps
     
     def forward(self, reps, labels, model, return_representations=False):
-        device = reps.device
         batch_size = reps.shape[0]
-        self.emo_anchor = self.emo_anchor.to(device)
-        self.emo_label = self.emo_label.to(device)
-        emo_anchor = model.map_function(self.emo_anchor)
+        emo_anchor = model.get_mapped_anchors()
+        flat_anchor = emo_anchor.view(-1, emo_anchor.shape[-1])
+        anchor_labels = model.emo_label.to(reps.device)
+        class_anchor = emo_anchor.mean(dim=1)
         if return_representations:
             sentiment_labels = labels
             sentiment_representations = reps.detach()
-            sentiment_anchortypes = emo_anchor.detach()
+            sentiment_anchortypes = flat_anchor.detach()
         else:
             sentiment_labels = None
             sentiment_representations = None
@@ -88,9 +81,9 @@ class SupConLoss(nn.Module):
             concated_labels = labels
             concated_bsz = batch_size
         else:
-            concated_reps = torch.cat([reps, emo_anchor], dim=0)
-            concated_labels = torch.cat([labels, self.emo_label], dim=0)
-            concated_bsz = batch_size + emo_anchor.shape[0]
+            concated_reps = torch.cat([reps, flat_anchor], dim=0)
+            concated_labels = torch.cat([labels, anchor_labels], dim=0)
+            concated_bsz = batch_size + flat_anchor.shape[0]
         mask1 = concated_labels.unsqueeze(0).expand(concated_labels.shape[0], concated_labels.shape[0])
         mask2 = concated_labels.unsqueeze(1).expand(concated_labels.shape[0], concated_labels.shape[0])
         mask = 1 - torch.eye(concated_bsz).to(reps.device)
@@ -107,7 +100,7 @@ class SupConLoss(nn.Module):
         
         scores -= torch.max(scores).item()
 
-        angleloss, max_cosine = AngleLoss(emo_anchor)
+        angleloss, max_cosine = AngleLoss(class_anchor)
         # print(max_cosine)
 
         scores = torch.exp(scores)
@@ -125,7 +118,7 @@ class SupConLoss(nn.Module):
             sentiment_representations=sentiment_representations,
             sentiment_labels=sentiment_labels,
             sentiment_anchortypes=sentiment_anchortypes,
-            anchortype_labels=self.emo_label,
+            anchortype_labels=anchor_labels,
             max_cosine = max_cosine
         )
     

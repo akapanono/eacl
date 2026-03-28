@@ -125,6 +125,10 @@ def get_parser():
     parser.add_argument("--disable_two_stage_training", action="store_true")
     parser.add_argument("--stage_two_lr", default=1e-4, type=float)
     parser.add_argument("--anchor_path", type=str)
+    parser.add_argument("--num_subanchors", type=int, default=1)
+    parser.add_argument("--prototype_momentum", type=float, default=0.9)
+    parser.add_argument("--prototype_pooling", type=str, default="max", choices=["max", "logsumexp"])
+    parser.add_argument("--disable_anchor_updates", action="store_true")
     
     # analysis
     parser.add_argument("--save_stage_two_cache", action="store_true")
@@ -237,9 +241,9 @@ if __name__ == '__main__':
         torch.cuda.empty_cache()
         # laod best 
         with torch.no_grad():
-            anchors = model.map_function(model.emo_anchor)
             model.load_state_dict(torch.load(path + args.dataset_name + '/model_' + '.pkl'))
             model.eval()
+            anchors = model.get_mapped_anchors()
             emb_train, emb_val, emb_test = [] ,[] ,[]
             label_train, label_val, label_test = [], [], []
             for batch_id, batch in enumerate(train_loader):
