@@ -14,6 +14,18 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$pythonExe = $null
+
+if ($env:CONDA_PREFIX) {
+    $candidate = Join-Path $env:CONDA_PREFIX "python.exe"
+    if (Test-Path $candidate) {
+        $pythonExe = $candidate
+    }
+}
+
+if (-not $pythonExe) {
+    $pythonExe = (Get-Command python).Source
+}
 
 function Get-LeafName([string]$PathValue) {
     return Split-Path -Path $PathValue -Leaf
@@ -53,11 +65,12 @@ Write-Host "Using physical GPU $PhysicalGpu"
 Write-Host "Dataset: $Dataset"
 Write-Host "Backbone: $BertPath"
 Write-Host "Sweep root: $datasetSweepRoot"
+Write-Host "Python: $pythonExe"
 
 foreach ($numSubanchor in $NumSubanchors) {
     Write-Host ""
     Write-Host "Generating anchors for num_subanchors=$numSubanchor"
-    python src\generate_anchors.py --bert_path $BertPath --num_subanchors $numSubanchor
+    & $pythonExe src\generate_anchors.py --bert_path $BertPath --num_subanchors $numSubanchor
 
     foreach ($seed in $Seeds) {
         foreach ($pooling in $Poolings) {
@@ -71,7 +84,7 @@ foreach ($numSubanchor in $NumSubanchors) {
             Write-Host ""
             Write-Host "Running $runName"
 
-            python src\run.py `
+            & $pythonExe src\run.py `
                 --anchor_path $anchorRoot `
                 --bert_path $BertPath `
                 --dataset_name $Dataset `
