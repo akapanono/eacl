@@ -1,6 +1,7 @@
 param(
     [string]$Dataset = "IEMOCAP",
     [string]$BertPath = ".\pretrained\sup-simcse-roberta-large",
+    [string]$PythonExe = "",
     [int]$PhysicalGpu = 1,
     [int[]]$Seeds = @(1, 2, 3, 4, 5),
     [int[]]$NumSubanchors = @(2, 3, 4),
@@ -16,7 +17,12 @@ param(
 $ErrorActionPreference = "Stop"
 $pythonExe = $null
 
-if ($env:CONDA_PREFIX) {
+if ($PythonExe) {
+    $resolvedPython = Resolve-Path $PythonExe -ErrorAction Stop
+    $pythonExe = $resolvedPython.Path
+}
+
+if (-not $pythonExe -and $env:CONDA_PREFIX) {
     $candidate = Join-Path $env:CONDA_PREFIX "python.exe"
     if (Test-Path $candidate) {
         $pythonExe = $candidate
