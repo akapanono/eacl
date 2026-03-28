@@ -15,6 +15,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $false
 $pythonExe = $null
 
 if ($PythonExe) {
@@ -106,6 +107,10 @@ foreach ($numSubanchor in $NumSubanchors) {
                 --prototype_pooling $pooling `
                 --gpu_id 0 `
                 --save_path $savePath 2>&1 | Tee-Object -FilePath $stdoutPath
+
+            if ($LASTEXITCODE -ne 0) {
+                throw "Training failed for $runName with exit code $LASTEXITCODE"
+            }
 
             $logPath = Join-Path $runRoot "$Dataset\logging.log"
             $bestVal = Read-Metric $logPath "Best F-Score based on validation:"
