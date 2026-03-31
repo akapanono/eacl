@@ -58,6 +58,14 @@ def build_shared_speaker_mapping(*datasets):
         dataset.speaker_ids = torch.LongTensor(ids)
     return speaker_to_idx
 
+def should_skip_stage_two(args):
+    dynamic_routing_enabled = args.prototype_topk > 1 or args.class_prototype_topk > 1
+    if args.disable_two_stage_training:
+        return True
+    if dynamic_routing_enabled and not args.force_two_stage:
+        return True
+    return False
+
 def get_paramsgroup(model, warmup=False):
     no_decay = ['bias', 'LayerNorm.weight']
     pre_train_lr = args.ptmlr
@@ -154,6 +162,7 @@ def get_parser():
     parser.add_argument("--routing_temperature", type=float, default=0.2)
     parser.add_argument("--prototype_usage_weight", type=float, default=0.02)
     parser.add_argument("--class_routing_entropy_weight", type=float, default=0.02)
+    parser.add_argument("--force_two_stage", action="store_true")
     
     # analysis
     parser.add_argument("--save_stage_two_cache", action="store_true")
@@ -258,8 +267,11 @@ if __name__ == '__main__':
     logger.info('finish stage 1 training!')
 
     all_fscore = sorted(all_fscore, key=lambda x: (x[0],x[1]), reverse=True)
+    skip_stage_two = should_skip_stage_two(args)
+    if skip_stage_two and not args.disable_two_stage_training:
+        logger.info('Dynamic prototype routing detected; skipping legacy stage 2 classifier. Use --force_two_stage to override.')
 
-    if args.disable_two_stage_training:
+    if skip_stage_two:
         if args.dataset_name=='DailyDialog':
             logger.info('Best micro/macro F-Score based on validation: {}/{}'.format(all_fscore[0][1],all_fscore[0][3]))
             all_fscore = sorted(all_fscore, key=lambda x: x[1], reverse=True)
