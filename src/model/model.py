@@ -82,25 +82,47 @@ class CLModel(nn.Module):
         mapped = self.map_function(flat_anchor)
         return mapped.view(self.num_classes, self.num_subanchors, -1)
 
+    def route_prototypes(self, semantic_outputs, anchors):
+        batch_size = semantic_outputs.shape[0]
+        flat_anchors = anchors.view(-1, anchors.shape[-1])
+        flat_scores = self.score_func(
+            semantic_outputs.unsqueeze(1),
+            flat_anchors.unsqueeze(0)
+        ) / self.args.routing_temperature
+        global_topk = min(self.args.prototype_topk, flat_scores.shape[-1])
+        global_scores, global_indices = torch.topk(flat_scores, k=global_topk, dim=-1)
+        global_weights = torch.softmax(global_scores, dim=-1)
+        selected_global = flat_anchors[global_indices]
+        routed_bank = (global_weights.unsqueeze(-1) * selected_global).sum(dim=1)
+
+        class_scores = self.score_func(
+            semantic_outputs.unsqueeze(1).unsqueeze(2),
+            anchors.unsqueeze(0)
+        ) / self.args.routing_temperature
+        class_topk = min(self.args.class_prototype_topk, class_scores.shape[-1])
+        topk_scores, topk_indices = torch.topk(class_scores, k=class_topk, dim=-1)
+        class_weights = torch.softmax(topk_scores, dim=-1)
+
+        gathered = anchors.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        gather_index = topk_indices.unsqueeze(-1).expand(-1, -1, -1, anchors.shape[-1])
+        selected_class_anchors = torch.gather(gathered, 2, gather_index)
+        class_prototypes = (class_weights.unsqueeze(-1) * selected_class_anchors).sum(dim=2)
+        return routed_bank, class_prototypes, global_weights, global_indices, class_weights
+
     def build_affective_representation(self, mask_outputs, speaker_ids):
         semantic_outputs = self.semantic_projector(mask_outputs)
         anchors = self.get_mapped_anchors()
-        class_anchors = anchors.mean(dim=1)
-        anchor_weights = torch.softmax(
-            self.score_func(
-                semantic_outputs.unsqueeze(1),
-                class_anchors.unsqueeze(0)
-            ) / self.args.transfer_temperature,
-            dim=-1
+        routed_bank, class_prototypes, routing_weights, routing_indices, class_weights = self.route_prototypes(
+            semantic_outputs,
+            anchors
         )
-        anchor_prior = torch.matmul(anchor_weights, class_anchors)
-        anchor_prior = self.anchor_prior_proj(anchor_prior)
+        anchor_prior = self.anchor_prior_proj(routed_bank)
         speaker_states = self.speaker_embedding(speaker_ids)
         transfer_inputs = torch.cat([semantic_outputs, anchor_prior, speaker_states], dim=-1)
         transfer_gate = self.transfer_gate(transfer_inputs)
         fused = self.transfer_fusion(transfer_inputs)
         affective_outputs = transfer_gate * semantic_outputs + (1.0 - transfer_gate) * fused
-        return semantic_outputs, affective_outputs, anchor_weights, class_anchors
+        return semantic_outputs, affective_outputs, routing_weights, routing_indices, class_weights, class_prototypes
 
     @torch.no_grad()
     def update_anchors(self, raw_outputs, labels):
@@ -143,24 +165,22 @@ class CLModel(nn.Module):
         )['last_hidden_state']
         mask_pos = (sentences == (self.mask_value)).long().max(1)[1]
         mask_outputs = utterance_encoded[torch.arange(mask_pos.shape[0]), mask_pos]
-        semantic_outputs, mask_mapped_outputs, anchor_weights, class_anchors = self.build_affective_representation(
+        semantic_outputs, mask_mapped_outputs, routing_weights, routing_indices, class_weights, class_prototypes = self.build_affective_representation(
             mask_outputs,
             speaker_ids
         )
         feature = torch.dropout(mask_mapped_outputs, self.dropout, train=self.training)
         feature = self.predictor(feature)
         if self.args.use_nearest_neighbour:
-            anchors = self.get_mapped_anchors()
-            self.last_emo_anchor = anchors
-            subanchor_scores = self.score_func(
-                mask_mapped_outputs.unsqueeze(1).unsqueeze(2),
-                anchors.unsqueeze(0)
-            )
-            anchor_scores = self.aggregate_subanchors(subanchor_scores)
+            self.last_emo_anchor = class_prototypes
+            anchor_scores = self.score_func(
+                mask_mapped_outputs.unsqueeze(1),
+                class_prototypes
+            ) / self.args.temp
             
         else:
             anchor_scores = None
-        return feature, mask_mapped_outputs, mask_outputs, semantic_outputs, anchor_weights, class_anchors, anchor_scores
+        return feature, mask_mapped_outputs, mask_outputs, semantic_outputs, routing_weights, routing_indices, class_weights, class_prototypes, anchor_scores
     
     def forward(self, sentences, speaker_ids=None, return_mask_output=False):
         '''
@@ -168,10 +188,10 @@ class CLModel(nn.Module):
         '''
         if speaker_ids is None:
             speaker_ids = torch.zeros(sentences.shape[0], dtype=torch.long, device=sentences.device)
-        feature, mask_mapped_outputs, mask_outputs, semantic_outputs, anchor_weights, class_anchors, anchor_scores = self._forward(sentences, speaker_ids)
+        feature, mask_mapped_outputs, mask_outputs, semantic_outputs, routing_weights, routing_indices, class_weights, class_prototypes, anchor_scores = self._forward(sentences, speaker_ids)
         
         if return_mask_output:
-            return feature, mask_mapped_outputs, mask_outputs, semantic_outputs, anchor_weights, class_anchors, anchor_scores
+            return feature, mask_mapped_outputs, mask_outputs, semantic_outputs, routing_weights, routing_indices, class_weights, class_prototypes, anchor_scores
         else:
             return feature
         
@@ -188,7 +208,17 @@ class Classifier(nn.Module):
         if self.args.prototype_pooling == "logsumexp":
             return torch.logsumexp(scores / self.args.temp, dim=-1)
         return scores.max(dim=-1)[0]
+
+    def route_class_prototypes(self, emb):
+        scores = self.score_func(self.weight.unsqueeze(0), emb.unsqueeze(1).unsqueeze(2)) / self.args.routing_temperature
+        topk = min(self.args.class_prototype_topk, scores.shape[-1])
+        topk_scores, topk_indices = torch.topk(scores, k=topk, dim=-1)
+        topk_weights = torch.softmax(topk_scores, dim=-1)
+        expanded_weight = self.weight.unsqueeze(0).expand(emb.shape[0], -1, -1, -1)
+        gather_index = topk_indices.unsqueeze(-1).expand(-1, -1, -1, self.weight.shape[-1])
+        selected = torch.gather(expanded_weight, 2, gather_index)
+        return (topk_weights.unsqueeze(-1) * selected).sum(dim=2)
     
     def forward(self, emb):
-        scores = self.score_func(self.weight.unsqueeze(0), emb.unsqueeze(1).unsqueeze(2))
-        return self.aggregate_subanchors(scores) / self.args.temp
+        class_prototypes = self.route_class_prototypes(emb)
+        return self.score_func(class_prototypes, emb.unsqueeze(1)) / self.args.temp

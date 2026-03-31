@@ -149,6 +149,11 @@ def get_parser():
     parser.add_argument("--transfer_margin_weight", type=float, default=0.1)
     parser.add_argument("--anchor_entropy_weight", type=float, default=0.01)
     parser.add_argument("--transfer_margin", type=float, default=0.05)
+    parser.add_argument("--prototype_topk", type=int, default=4)
+    parser.add_argument("--class_prototype_topk", type=int, default=2)
+    parser.add_argument("--routing_temperature", type=float, default=0.2)
+    parser.add_argument("--prototype_usage_weight", type=float, default=0.02)
+    parser.add_argument("--class_routing_entropy_weight", type=float, default=0.02)
     
     # analysis
     parser.add_argument("--save_stage_two_cache", action="store_true")
@@ -282,7 +287,7 @@ if __name__ == '__main__':
                 speaker_ids = speaker_ids.to(device)
                 if args.fp16:
                     with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        log_prob, masked_mapped_output, masked_outputs, semantic_output, anchor_weights, class_anchors, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
+                        log_prob, masked_mapped_output, masked_outputs, semantic_output, routing_weights, routing_indices, class_weights, class_prototypes, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
                 emb_train.append(masked_mapped_output.detach().cpu())
                 label_train.append(label.cpu())
             emb_train = torch.cat(emb_train, dim=0)
@@ -296,7 +301,7 @@ if __name__ == '__main__':
                 speaker_ids = speaker_ids.to(device)
                 if args.fp16:
                     with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        log_prob, masked_mapped_output, masked_outputs, semantic_output, anchor_weights, class_anchors, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
+                        log_prob, masked_mapped_output, masked_outputs, semantic_output, routing_weights, routing_indices, class_weights, class_prototypes, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
                 emb_val.append(masked_mapped_output.detach().cpu())
                 label_val.append(label.cpu())
             emb_val = torch.cat(emb_val, dim=0)
@@ -310,7 +315,7 @@ if __name__ == '__main__':
                 speaker_ids = speaker_ids.to(device)
                 if args.fp16:
                     with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        log_prob, masked_mapped_output, masked_outputs, semantic_output, anchor_weights, class_anchors, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
+                        log_prob, masked_mapped_output, masked_outputs, semantic_output, routing_weights, routing_indices, class_weights, class_prototypes, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
                 emb_test.append(masked_mapped_output.detach().cpu())
                 label_test.append(label.cpu())
             emb_test = torch.cat(emb_test, dim=0)

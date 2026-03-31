@@ -108,12 +108,12 @@ def _forward(model, loss_function, input_orig, input_aug, label, speaker_ids, de
     mask = torch.ones(len(input_orig)).to(device)
     mask = mask > 0.5
     if model.training:
-        log_prob, masked_mapped_output, masked_output, semantic_output, anchor_weights, class_anchors, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
-        loss_output = loss_function(log_prob, masked_mapped_output, masked_output, semantic_output, anchor_weights, class_anchors, label, mask, model)
+        log_prob, masked_mapped_output, masked_output, semantic_output, routing_weights, routing_indices, class_weights, class_prototypes, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
+        loss_output = loss_function(log_prob, masked_mapped_output, masked_output, semantic_output, routing_weights, routing_indices, class_weights, class_prototypes, label, mask, model)
     else:
         with torch.no_grad():
-            log_prob, masked_mapped_output, masked_output, semantic_output, anchor_weights, class_anchors, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
-            loss_output = loss_function(log_prob, masked_mapped_output, masked_output, semantic_output, anchor_weights, class_anchors, label, mask, model)
+            log_prob, masked_mapped_output, masked_output, semantic_output, routing_weights, routing_indices, class_weights, class_prototypes, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
+            loss_output = loss_function(log_prob, masked_mapped_output, masked_output, semantic_output, routing_weights, routing_indices, class_weights, class_prototypes, label, mask, model)
     loss = (
         loss_output.ce_loss * model.args.ce_loss_weight
         + (1 - model.args.ce_loss_weight) * loss_output.cl_loss

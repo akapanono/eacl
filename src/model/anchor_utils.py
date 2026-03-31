@@ -188,6 +188,18 @@ def get_subanchor_templates(dataset_name):
 
 def expand_templates(dataset_name, num_subanchors):
     templates = get_subanchor_templates(dataset_name)
+    semantic_suffixes = [
+        "The feeling is mild but noticeable.",
+        "The feeling is intense and sustained.",
+        "The emotion is expressed directly in conversation.",
+        "The emotion is partially suppressed but still visible.",
+        "The emotion is triggered by the dialogue context.",
+        "The emotion reflects an interpersonal reaction.",
+        "The emotion changes the speaker's tone and intent.",
+        "The emotion is socially controlled rather than explosive.",
+        "The feeling appears suddenly in the current turn.",
+        "The feeling has been building across previous turns.",
+    ]
     expanded = {}
     for emotion, variants in templates.items():
         if len(variants) >= num_subanchors:
@@ -195,7 +207,9 @@ def expand_templates(dataset_name, num_subanchors):
             continue
         copied = list(variants)
         while len(copied) < num_subanchors:
-            copied.append(f"{variants[len(copied) % len(variants)]} Variant {len(copied) + 1}.")
+            base = variants[len(copied) % len(variants)]
+            suffix = semantic_suffixes[(len(copied) - len(variants)) % len(semantic_suffixes)]
+            copied.append(f"{base} {suffix}")
         expanded[emotion] = copied
     return expanded
 
