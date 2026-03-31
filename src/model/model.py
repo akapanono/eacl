@@ -23,13 +23,36 @@ class CLModel(nn.Module):
         self.predictor = nn.Sequential(
             # nn.Linear(self.dim, self.dim),
             # nn.ReLU(),
-            nn.Linear(self.dim, self.num_classes)
+            nn.Linear(args.mapping_lower_dim, self.num_classes)
         )
+        self.semantic_projector = nn.Sequential(
+            nn.Linear(self.dim, self.dim),
+            nn.LayerNorm(self.dim),
+            nn.ReLU(),
+            nn.Linear(self.dim, args.mapping_lower_dim),
+        ).to(self.device)
         self.map_function = nn.Sequential(
             nn.Linear(self.dim, self.dim),
             nn.LayerNorm(self.dim),
             nn.ReLU(),
             nn.Linear(self.dim, args.mapping_lower_dim),
+        ).to(self.device)
+        self.speaker_embedding = nn.Embedding(args.max_speakers, args.mapping_lower_dim).to(self.device)
+        self.anchor_prior_proj = nn.Sequential(
+            nn.Linear(args.mapping_lower_dim, args.mapping_lower_dim),
+            nn.LayerNorm(args.mapping_lower_dim),
+            nn.Tanh(),
+        ).to(self.device)
+        transfer_dim = args.mapping_lower_dim * 3
+        self.transfer_gate = nn.Sequential(
+            nn.Linear(transfer_dim, args.mapping_lower_dim),
+            nn.Sigmoid(),
+        ).to(self.device)
+        self.transfer_fusion = nn.Sequential(
+            nn.Linear(transfer_dim, args.mapping_lower_dim),
+            nn.LayerNorm(args.mapping_lower_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
         ).to(self.device)
 
         self.tokenizer = tokenizer
@@ -58,6 +81,26 @@ class CLModel(nn.Module):
         flat_anchor = self.emo_anchor.view(-1, self.dim)
         mapped = self.map_function(flat_anchor)
         return mapped.view(self.num_classes, self.num_subanchors, -1)
+
+    def build_affective_representation(self, mask_outputs, speaker_ids):
+        semantic_outputs = self.semantic_projector(mask_outputs)
+        anchors = self.get_mapped_anchors()
+        class_anchors = anchors.mean(dim=1)
+        anchor_weights = torch.softmax(
+            self.score_func(
+                semantic_outputs.unsqueeze(1),
+                class_anchors.unsqueeze(0)
+            ) / self.args.transfer_temperature,
+            dim=-1
+        )
+        anchor_prior = torch.matmul(anchor_weights, class_anchors)
+        anchor_prior = self.anchor_prior_proj(anchor_prior)
+        speaker_states = self.speaker_embedding(speaker_ids)
+        transfer_inputs = torch.cat([semantic_outputs, anchor_prior, speaker_states], dim=-1)
+        transfer_gate = self.transfer_gate(transfer_inputs)
+        fused = self.transfer_fusion(transfer_inputs)
+        affective_outputs = transfer_gate * semantic_outputs + (1.0 - transfer_gate) * fused
+        return semantic_outputs, affective_outputs, anchor_weights, class_anchors
 
     @torch.no_grad()
     def update_anchors(self, raw_outputs, labels):
@@ -89,7 +132,7 @@ class CLModel(nn.Module):
                     centroid * (1.0 - self.args.prototype_momentum)
                 )
     
-    def _forward(self, sentences):
+    def _forward(self, sentences, speaker_ids):
         mask = 1 - (sentences == (self.pad_value)).long()
 
         utterance_encoded = self.f_context_encoder(
@@ -100,8 +143,11 @@ class CLModel(nn.Module):
         )['last_hidden_state']
         mask_pos = (sentences == (self.mask_value)).long().max(1)[1]
         mask_outputs = utterance_encoded[torch.arange(mask_pos.shape[0]), mask_pos]
-        mask_mapped_outputs = self.map_function(mask_outputs)
-        feature = torch.dropout(mask_outputs, self.dropout, train=self.training)
+        semantic_outputs, mask_mapped_outputs, anchor_weights, class_anchors = self.build_affective_representation(
+            mask_outputs,
+            speaker_ids
+        )
+        feature = torch.dropout(mask_mapped_outputs, self.dropout, train=self.training)
         feature = self.predictor(feature)
         if self.args.use_nearest_neighbour:
             anchors = self.get_mapped_anchors()
@@ -114,16 +160,18 @@ class CLModel(nn.Module):
             
         else:
             anchor_scores = None
-        return feature, mask_mapped_outputs, mask_outputs, anchor_scores
+        return feature, mask_mapped_outputs, mask_outputs, semantic_outputs, anchor_weights, class_anchors, anchor_scores
     
-    def forward(self, sentences, return_mask_output=False):
+    def forward(self, sentences, speaker_ids=None, return_mask_output=False):
         '''
         generate vector representations for each turn of conversation
         '''
-        feature, mask_mapped_outputs, mask_outputs, anchor_scores = self._forward(sentences)
+        if speaker_ids is None:
+            speaker_ids = torch.zeros(sentences.shape[0], dtype=torch.long, device=sentences.device)
+        feature, mask_mapped_outputs, mask_outputs, semantic_outputs, anchor_weights, class_anchors, anchor_scores = self._forward(sentences, speaker_ids)
         
         if return_mask_output:
-            return feature, mask_mapped_outputs, mask_outputs, anchor_scores
+            return feature, mask_mapped_outputs, mask_outputs, semantic_outputs, anchor_weights, class_anchors, anchor_scores
         else:
             return feature
         

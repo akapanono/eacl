@@ -20,6 +20,7 @@ class DialogueDataset(Dataset):
         self.max_len = args.max_len
         self.pad_value = args.pad_value
         self.dataset_name = dataset_name
+        self.speaker_to_idx = {"<unk>": 0}
 
         self.emotion_map = pickle.load(open(f'./data/{dataset_name}/label_vocab.pkl', 'rb'))
         # print(self.emotion_map)
@@ -29,9 +30,10 @@ class DialogueDataset(Dataset):
         self.MASK = _special_tokens_ids[1]
         self.SEP = _special_tokens_ids[2]
 
-        self.data, self.labels, self.utterance_sequence = self.read(dataset_name, split, tokenizer)
+        self.data, self.labels, self.utterance_sequence, self.speaker_ids = self.read(dataset_name, split, tokenizer)
         
         assert len(self.data) == len(self.labels)
+        assert len(self.data) == len(self.speaker_ids)
 
     def pad_to_len(self, list_data, max_len, pad_value):
         list_data = list_data[-max_len:]
@@ -54,6 +56,7 @@ class DialogueDataset(Dataset):
         utterance_sequence = []
         ret_utterances = []
         ret_labels = []
+        ret_speaker_ids = []
 
 
         for dialogue in dialogs:
@@ -79,6 +82,7 @@ class DialogueDataset(Dataset):
                 input_ids = full_context[:-len(utterance_ids[query_idx])]
                 ret_utterances.append((input_ids, turn_data['speaker'], turn_data['text']))# input_ids, speaker
                 ret_labels.append(dialogue[query_idx]['label'])
+                ret_speaker_ids.append(self.get_speaker_idx(turn_data['speaker']))
 
                 utterance_seq.append({
                     "uttrance": text_with_speaker,
@@ -88,7 +92,13 @@ class DialogueDataset(Dataset):
 
         data_list = ret_utterances
         label_list = torch.LongTensor(ret_labels)
-        return data_list, label_list, utterance_sequence
+        speaker_ids = torch.LongTensor(ret_speaker_ids)
+        return data_list, label_list, utterance_sequence, speaker_ids
+
+    def get_speaker_idx(self, speaker):
+        if speaker not in self.speaker_to_idx:
+            self.speaker_to_idx[speaker] = len(self.speaker_to_idx)
+        return self.speaker_to_idx[speaker]
 
     def process(self, data):
         input_ids, speaker, text = data
@@ -108,8 +118,9 @@ class DialogueDataset(Dataset):
         text = self.data[index]
         text = self.process(text)
         label = self.labels[index]
-       
-        return text, label
+        speaker_id = self.speaker_ids[index]
+
+        return text, label, speaker_id
 
     def __len__(self):
         return len(self.data)

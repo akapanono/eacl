@@ -45,6 +45,19 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
+def build_shared_speaker_mapping(*datasets):
+    speaker_to_idx = {"<unk>": 0}
+    for dataset in datasets:
+        ids = []
+        for sample in dataset.data:
+            speaker = sample[1]
+            if speaker not in speaker_to_idx:
+                speaker_to_idx[speaker] = len(speaker_to_idx)
+            ids.append(speaker_to_idx[speaker])
+        dataset.speaker_to_idx = speaker_to_idx
+        dataset.speaker_ids = torch.LongTensor(ids)
+    return speaker_to_idx
+
 def get_paramsgroup(model, warmup=False):
     no_decay = ['bias', 'LayerNorm.weight']
     pre_train_lr = args.ptmlr
@@ -129,6 +142,13 @@ def get_parser():
     parser.add_argument("--prototype_momentum", type=float, default=0.9)
     parser.add_argument("--prototype_pooling", type=str, default="max", choices=["max", "logsumexp"])
     parser.add_argument("--disable_anchor_updates", action="store_true")
+    parser.add_argument("--max_speakers", type=int, default=64)
+    parser.add_argument("--transfer_temperature", type=float, default=0.7)
+    parser.add_argument("--prototype_align_weight", type=float, default=0.2)
+    parser.add_argument("--semantic_consistency_weight", type=float, default=0.1)
+    parser.add_argument("--transfer_margin_weight", type=float, default=0.1)
+    parser.add_argument("--anchor_entropy_weight", type=float, default=0.01)
+    parser.add_argument("--transfer_margin", type=float, default=0.05)
     
     # analysis
     parser.add_argument("--save_stage_two_cache", action="store_true")
@@ -174,6 +194,13 @@ if __name__ == '__main__':
     trainset = DialogueDataset(args, dataset_name = args.dataset_name, split='train', tokenizer=tokenizer)
     devset = DialogueDataset(args, dataset_name = args.dataset_name, split='dev', tokenizer=tokenizer)
     testset = DialogueDataset(args, dataset_name = args.dataset_name, split='test', tokenizer=tokenizer)
+    shared_speaker_to_idx = build_shared_speaker_mapping(trainset, devset, testset)
+    observed_max_speaker = max(
+        int(trainset.speaker_ids.max().item()),
+        int(devset.speaker_ids.max().item()),
+        int(testset.speaker_ids.max().item())
+    ) + 1
+    args.max_speakers = max(args.max_speakers, observed_max_speaker)
 
     sampler = torch.utils.data.RandomSampler(
         trainset
@@ -247,40 +274,43 @@ if __name__ == '__main__':
             emb_train, emb_val, emb_test = [] ,[] ,[]
             label_train, label_val, label_test = [], [], []
             for batch_id, batch in enumerate(train_loader):
-                input_ids, label = batch
+                input_ids, label, speaker_ids = batch
                 input_orig = input_ids
                 input_aug = None
                 input_ids = input_orig.to(device)
                 label = label.to(device)
+                speaker_ids = speaker_ids.to(device)
                 if args.fp16:
                     with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(input_ids, return_mask_output=True) 
+                        log_prob, masked_mapped_output, masked_outputs, semantic_output, anchor_weights, class_anchors, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
                 emb_train.append(masked_mapped_output.detach().cpu())
                 label_train.append(label.cpu())
             emb_train = torch.cat(emb_train, dim=0)
             label_train = torch.cat(label_train, dim=0)
             for batch_id, batch in enumerate(valid_loader):
-                input_ids, label = batch
+                input_ids, label, speaker_ids = batch
                 input_orig = input_ids
                 input_aug = None
                 input_ids = input_orig.to(device)
                 label = label.to(device)
+                speaker_ids = speaker_ids.to(device)
                 if args.fp16:
                     with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(input_ids, return_mask_output=True) 
+                        log_prob, masked_mapped_output, masked_outputs, semantic_output, anchor_weights, class_anchors, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
                 emb_val.append(masked_mapped_output.detach().cpu())
                 label_val.append(label.cpu())
             emb_val = torch.cat(emb_val, dim=0)
             label_val = torch.cat(label_val, dim=0)
             for batch_id, batch in enumerate(test_loader):
-                input_ids, label = batch
+                input_ids, label, speaker_ids = batch
                 input_orig = input_ids
                 input_aug = None
                 input_ids = input_orig.to(device)
                 label = label.to(device)
+                speaker_ids = speaker_ids.to(device)
                 if args.fp16:
                     with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(input_ids, return_mask_output=True) 
+                        log_prob, masked_mapped_output, masked_outputs, semantic_output, anchor_weights, class_anchors, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
                 emb_test.append(masked_mapped_output.detach().cpu())
                 label_test.append(label.cpu())
             emb_test = torch.cat(emb_test, dim=0)

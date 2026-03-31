@@ -21,16 +21,16 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
     
     for batch_id, batch in enumerate(pbar):
         
-        input_ids, label = batch
+        input_ids, label, speaker_ids = batch
        
         input_orig = input_ids
         input_aug = None
 
         if args.fp16:
             with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                loss, loss_output, log_prob, label, mask, anchor_scores = _forward(model, loss_function, input_orig, input_aug, label, device)
+                loss, loss_output, log_prob, label, mask, anchor_scores = _forward(model, loss_function, input_orig, input_aug, label, speaker_ids, device)
         else:
-            loss, loss_output, log_prob, label, mask, anchor_scores = _forward(model, loss_function, input_orig, input_aug, label, device)
+            loss, loss_output, log_prob, label, mask, anchor_scores = _forward(model, loss_function, input_orig, input_aug, label, speaker_ids, device)
 
         if args.use_nearest_neighbour:
             pred = torch.argmax(anchor_scores[mask], dim=-1)
@@ -100,20 +100,25 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
     return avg_loss, avg_accuracy, labels, preds, avg_fscore, f1_scores, max_cosine
 
 
-def _forward(model, loss_function, input_orig, input_aug, label, device):
+def _forward(model, loss_function, input_orig, input_aug, label, speaker_ids, device):
 
     input_ids = input_orig.to(device)
     label = label.to(device)
+    speaker_ids = speaker_ids.to(device)
     mask = torch.ones(len(input_orig)).to(device)
     mask = mask > 0.5
     if model.training:
-        log_prob, masked_mapped_output, masked_output, anchor_scores = model(input_ids, return_mask_output=True) 
-        loss_output = loss_function(log_prob, masked_mapped_output, masked_output, label, mask, model)
+        log_prob, masked_mapped_output, masked_output, semantic_output, anchor_weights, class_anchors, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
+        loss_output = loss_function(log_prob, masked_mapped_output, masked_output, semantic_output, anchor_weights, class_anchors, label, mask, model)
     else:
         with torch.no_grad():
-            log_prob, masked_mapped_output, masked_output, anchor_scores = model(input_ids, return_mask_output=True) 
-            loss_output = loss_function(log_prob, masked_mapped_output, masked_output, label, mask, model)
-    loss = loss_output.ce_loss * model.args.ce_loss_weight + (1 - model.args.ce_loss_weight) * loss_output.cl_loss
+            log_prob, masked_mapped_output, masked_output, semantic_output, anchor_weights, class_anchors, anchor_scores = model(input_ids, speaker_ids, return_mask_output=True) 
+            loss_output = loss_function(log_prob, masked_mapped_output, masked_output, semantic_output, anchor_weights, class_anchors, label, mask, model)
+    loss = (
+        loss_output.ce_loss * model.args.ce_loss_weight
+        + (1 - model.args.ce_loss_weight) * loss_output.cl_loss
+        + loss_output.transfer_loss
+    )
 
     return loss, loss_output, log_prob, label[mask], mask, anchor_scores
 

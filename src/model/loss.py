@@ -8,28 +8,57 @@ import torch.nn.functional as F
 class HybridLossOutput:
     ce_loss:torch.Tensor = None
     cl_loss:torch.Tensor = None
+    transfer_loss:torch.Tensor = None
     sentiment_representations:torch.Tensor = None
     sentiment_labels:torch.Tensor = None
     sentiment_anchortypes:torch.Tensor = None
     anchortype_labels:torch.Tensor = None
     max_cosine:torch.Tensor = None
 
-def loss_function(log_prob, reps, raw_reps, label, mask, model):
+def loss_function(log_prob, reps, raw_reps, semantic_reps, anchor_weights, class_anchors, label, mask, model):
     ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-1).to(reps.device)
     scl_loss_fn = SupConLoss(model.args)
     cl_loss = scl_loss_fn(reps, label, model, return_representations=not model.training)
     ce_loss = ce_loss_fn(log_prob[mask], label[mask])
+    transfer_loss = prototype_transfer_loss(reps, semantic_reps, class_anchors, anchor_weights, label, model.args)
     if model.training:
         model.update_anchors(raw_reps, label)
     return HybridLossOutput(
         ce_loss=ce_loss,
         cl_loss=cl_loss.loss,
+        transfer_loss=transfer_loss,
         sentiment_representations=cl_loss.sentiment_representations,
         sentiment_labels=cl_loss.sentiment_labels,
         sentiment_anchortypes=cl_loss.sentiment_anchortypes,
         anchortype_labels=cl_loss.anchortype_labels,
         max_cosine = cl_loss.max_cosine
     ) 
+
+def prototype_transfer_loss(reps, semantic_reps, class_anchors, anchor_weights, labels, args):
+    valid_mask = labels >= 0
+    if valid_mask.sum().item() == 0:
+        return reps.new_tensor(0.0)
+
+    reps = reps[valid_mask]
+    semantic_reps = semantic_reps[valid_mask]
+    labels = labels[valid_mask]
+    anchor_weights = anchor_weights[valid_mask]
+    pos_anchors = class_anchors[labels]
+
+    pos_align = 1 - F.cosine_similarity(reps, pos_anchors, dim=-1)
+    semantic_consistency = 1 - F.cosine_similarity(reps, semantic_reps, dim=-1)
+    class_indices = torch.arange(class_anchors.shape[0], device=labels.device).unsqueeze(0)
+    neg_mask = class_indices != labels.unsqueeze(1)
+    neg_scores = torch.matmul(F.normalize(reps, dim=-1), F.normalize(class_anchors, dim=-1).transpose(0, 1))
+    hardest_negative = neg_scores.masked_fill(~neg_mask, -1e4).max(dim=-1)[0]
+    margin = F.relu(hardest_negative - (1 - pos_align) + args.transfer_margin)
+    entropy = -(anchor_weights * torch.log(anchor_weights + 1e-8)).sum(dim=-1)
+    return (
+        args.prototype_align_weight * pos_align.mean()
+        + args.semantic_consistency_weight * semantic_consistency.mean()
+        + args.transfer_margin_weight * margin.mean()
+        + args.anchor_entropy_weight * entropy.mean()
+    )
 
 def AngleLoss(means):
     g_mean = means.mean(dim=0)
