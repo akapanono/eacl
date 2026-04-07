@@ -50,6 +50,17 @@ class CLModel(nn.Module):
     def aggregate_subanchors(self, scores):
         if scores.dim() != 3:
             return scores
+        if self.args.prototype_pooling == "entropy":
+            domain_logits = scores.transpose(1, 2) / self.args.temp
+            domain_probs = F.softmax(domain_logits, dim=-1)
+            entropy = -(domain_probs * torch.log(domain_probs + self.eps)).sum(dim=-1)
+            domain_weights = 1.0 / (entropy + self.args.domain_entropy_eps)
+            domain_weights = domain_weights / (domain_weights.sum(dim=-1, keepdim=True) + self.eps)
+            fused_probs = (domain_weights.unsqueeze(-1) * domain_probs).sum(dim=1)
+            self.last_domain_probs = domain_probs.detach()
+            self.last_domain_weights = domain_weights.detach()
+            self.last_domain_entropy = entropy.detach()
+            return torch.log(fused_probs + self.eps)
         if self.args.prototype_pooling == "logsumexp":
             return torch.logsumexp(scores / self.args.temp, dim=-1)
         return scores.max(dim=-1)[0]
@@ -111,6 +122,8 @@ class CLModel(nn.Module):
                 anchors.unsqueeze(0)
             )
             anchor_scores = self.aggregate_subanchors(subanchor_scores)
+            if self.args.prototype_pooling == "entropy":
+                feature = anchor_scores
             
         else:
             anchor_scores = None
@@ -137,6 +150,14 @@ class Classifier(nn.Module):
         return (1 + F.cosine_similarity(x, y, dim=-1))/2 + 1e-8
 
     def aggregate_subanchors(self, scores):
+        if self.args.prototype_pooling == "entropy":
+            domain_logits = scores.transpose(1, 2) / self.args.temp
+            domain_probs = F.softmax(domain_logits, dim=-1)
+            entropy = -(domain_probs * torch.log(domain_probs + 1e-8)).sum(dim=-1)
+            domain_weights = 1.0 / (entropy + self.args.domain_entropy_eps)
+            domain_weights = domain_weights / (domain_weights.sum(dim=-1, keepdim=True) + 1e-8)
+            fused_probs = (domain_weights.unsqueeze(-1) * domain_probs).sum(dim=1)
+            return torch.log(fused_probs + 1e-8)
         if self.args.prototype_pooling == "logsumexp":
             return torch.logsumexp(scores / self.args.temp, dim=-1)
         return scores.max(dim=-1)[0]

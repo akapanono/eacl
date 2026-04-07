@@ -127,7 +127,8 @@ def get_parser():
     parser.add_argument("--anchor_path", type=str)
     parser.add_argument("--num_subanchors", type=int, default=1)
     parser.add_argument("--prototype_momentum", type=float, default=0.9)
-    parser.add_argument("--prototype_pooling", type=str, default="max", choices=["max", "logsumexp"])
+    parser.add_argument("--prototype_pooling", type=str, default="max", choices=["max", "logsumexp", "entropy"])
+    parser.add_argument("--domain_entropy_eps", type=float, default=1e-6)
     parser.add_argument("--disable_anchor_updates", action="store_true")
     
     # analysis
@@ -139,6 +140,8 @@ def get_parser():
 
 if __name__ == '__main__':
     args = get_parser()
+    if args.prototype_pooling == "entropy" and args.num_subanchors != 4:
+        raise ValueError("--prototype_pooling entropy expects --num_subanchors 4 so each subanchor index maps to one domain.")
     if args.fp16:
         torch.set_float32_matmul_precision('medium')
     path = args.save_path
