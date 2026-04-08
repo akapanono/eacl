@@ -31,6 +31,22 @@ class CLModel(nn.Module):
             nn.ReLU(),
             nn.Linear(self.dim, args.mapping_lower_dim),
         ).to(self.device)
+        self.domain_adapters = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.dim, self.dim),
+                nn.LayerNorm(self.dim),
+                nn.ReLU(),
+                nn.Dropout(self.dropout),
+                nn.Linear(self.dim, args.mapping_lower_dim),
+            )
+            for _ in range(args.num_subanchors)
+        ]).to(self.device)
+        self.domain_gate = nn.Sequential(
+            nn.Linear(self.dim, self.dim // 2),
+            nn.LayerNorm(self.dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.dim // 2, args.num_subanchors),
+        ).to(self.device)
 
         self.tokenizer = tokenizer
         anchor_tensor = load_anchor_tensor(args.anchor_path, args.dataset_name, args.num_subanchors).float()
@@ -69,6 +85,32 @@ class CLModel(nn.Module):
         flat_anchor = self.emo_anchor.view(-1, self.dim)
         mapped = self.map_function(flat_anchor)
         return mapped.view(self.num_classes, self.num_subanchors, -1)
+
+    def get_domain_mapped_anchors(self):
+        domain_anchors = []
+        for domain_id, adapter in enumerate(self.domain_adapters):
+            domain_anchor = self.emo_anchor[:, domain_id, :]
+            domain_anchors.append(adapter(domain_anchor).unsqueeze(1))
+        return torch.cat(domain_anchors, dim=1)
+
+    def domain_gated_scores(self, mask_outputs):
+        anchors = self.get_domain_mapped_anchors()
+        domain_features = []
+        for adapter in self.domain_adapters:
+            domain_features.append(adapter(mask_outputs).unsqueeze(1))
+        domain_features = torch.cat(domain_features, dim=1)
+        domain_scores = self.score_func(
+            domain_features.unsqueeze(2),
+            anchors.transpose(0, 1).unsqueeze(0)
+        )
+        domain_logits = domain_scores / self.args.temp
+        domain_probs = F.softmax(domain_logits, dim=-1)
+        domain_weights = F.softmax(self.domain_gate(mask_outputs), dim=-1)
+        fused_probs = (domain_weights.unsqueeze(-1) * domain_probs).sum(dim=1)
+        self.last_emo_anchor = anchors
+        self.last_domain_probs = domain_probs.detach()
+        self.last_domain_weights = domain_weights.detach()
+        return torch.log(fused_probs + self.eps), domain_features.mean(dim=1), anchors
 
     @torch.no_grad()
     def update_anchors(self, raw_outputs, labels):
@@ -111,6 +153,10 @@ class CLModel(nn.Module):
         )['last_hidden_state']
         mask_pos = (sentences == (self.mask_value)).long().max(1)[1]
         mask_outputs = utterance_encoded[torch.arange(mask_pos.shape[0]), mask_pos]
+        if self.args.prototype_pooling == "domain_gated":
+            feature, mask_mapped_outputs, _ = self.domain_gated_scores(mask_outputs)
+            anchor_scores = feature if self.args.use_nearest_neighbour else None
+            return feature, mask_mapped_outputs, mask_outputs, anchor_scores
         mask_mapped_outputs = self.map_function(mask_outputs)
         feature = torch.dropout(mask_outputs, self.dropout, train=self.training)
         feature = self.predictor(feature)
@@ -150,6 +196,17 @@ class Classifier(nn.Module):
         return (1 + F.cosine_similarity(x, y, dim=-1))/2 + 1e-8
 
     def aggregate_subanchors(self, scores):
+        if self.args.prototype_pooling == "domain_gated":
+            domain_logits = scores.transpose(1, 2) / self.args.temp
+            domain_probs = F.softmax(domain_logits, dim=-1)
+            domain_weights = torch.ones(
+                scores.shape[0],
+                scores.shape[2],
+                device=scores.device,
+                dtype=scores.dtype
+            ) / scores.shape[2]
+            fused_probs = (domain_weights.unsqueeze(-1) * domain_probs).sum(dim=1)
+            return torch.log(fused_probs + 1e-8)
         if self.args.prototype_pooling == "entropy":
             domain_logits = scores.transpose(1, 2) / self.args.temp
             domain_probs = F.softmax(domain_logits, dim=-1)
@@ -164,4 +221,7 @@ class Classifier(nn.Module):
     
     def forward(self, emb):
         scores = self.score_func(self.weight.unsqueeze(0), emb.unsqueeze(1).unsqueeze(2))
-        return self.aggregate_subanchors(scores) / self.args.temp
+        output = self.aggregate_subanchors(scores)
+        if self.args.prototype_pooling in ["entropy", "domain_gated"]:
+            return output
+        return output / self.args.temp
