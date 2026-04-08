@@ -24,7 +24,7 @@ if __name__ == "__main__":
 
     model = AutoModel.from_pretrained(args.bert_path, local_files_only=True)
     model.eval()
-    save_path = args.bert_path.split("/")[-1]
+    save_path = os.path.basename(os.path.normpath(args.bert_path))
     feature_extractor = pipeline("feature-extraction",framework="pt",model=args.bert_path)
     os.makedirs(f"./emo_anchors/{save_path}", exist_ok=True)
 
@@ -44,5 +44,8 @@ if __name__ == "__main__":
                 centers.append(stacked.mean(0, keepdim=True))
         anchors = torch.cat(anchors, dim=0)
         centers = torch.cat(centers, dim=0)
-        torch.save(anchors, f"./emo_anchors/{save_path}/{get_anchor_filename(dataset_name, args.num_subanchors)}")
-        torch.save(centers, f"./emo_anchors/{save_path}/{dataset_name.lower()}_emo.pt")
+        anchor_file = f"./emo_anchors/{save_path}/{get_anchor_filename(dataset_name, args.num_subanchors)}"
+        center_file = f"./emo_anchors/{save_path}/{dataset_name.lower()}_emo.pt"
+        torch.save(anchors, anchor_file)
+        torch.save(centers, center_file)
+        print(f"Saved {dataset_name} anchors to {anchor_file} with shape {tuple(anchors.shape)}")
