@@ -346,6 +346,11 @@ def load_anchor_tensor(anchor_path, dataset_name, num_subanchors):
     if os.path.exists(preferred):
         anchors = torch.load(preferred, map_location="cpu")
     else:
+        if num_subanchors > 1:
+            raise FileNotFoundError(
+                f"Missing anchor file: {preferred}. "
+                f"Please run `python src/generate_anchors.py --bert_path <model_path> --num_subanchors {num_subanchors}` first."
+            )
         legacy = os.path.join(anchor_path, f"{dataset_name.lower()}_emo.pt")
         anchors = torch.load(legacy, map_location="cpu")
     if anchors.dim() == 2:
