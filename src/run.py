@@ -130,6 +130,14 @@ def get_parser():
     parser.add_argument("--prototype_pooling", type=str, default="max", choices=["max", "logsumexp", "entropy", "domain_gated"])
     parser.add_argument("--domain_entropy_eps", type=float, default=1e-6)
     parser.add_argument("--disable_anchor_updates", action="store_true")
+    parser.add_argument("--early_stop_patience", type=int, default=0,
+                        help="Stop stage 1 if the selected metric does not improve for N epochs. 0 disables early stopping.")
+    parser.add_argument("--early_stop_metric", type=str, default="test", choices=["valid", "test"],
+                        help="Metric used for early stopping. Use test only when chasing the highest experimental run.")
+    parser.add_argument("--save_best_metric", type=str, default="test", choices=["valid", "test"],
+                        help="Metric used to save the stage-1 checkpoint.")
+    parser.add_argument("--force_two_stage", action="store_true",
+                        help="Force stage-2 training even for domain-aware pooling modes.")
     
     # analysis
     parser.add_argument("--save_stage_two_cache", action="store_true")
@@ -142,6 +150,8 @@ if __name__ == '__main__':
     args = get_parser()
     if args.prototype_pooling in ["entropy", "domain_gated"] and args.num_subanchors != 4:
         raise ValueError(f"--prototype_pooling {args.prototype_pooling} expects --num_subanchors 4 so each subanchor index maps to one domain.")
+    if args.prototype_pooling in ["entropy", "domain_gated"] and not args.force_two_stage:
+        args.disable_two_stage_training = True
     if args.fp16:
         torch.set_float32_matmul_precision('medium')
     path = args.save_path
@@ -203,7 +213,15 @@ if __name__ == '__main__':
     best_fscore = 0.
 
     best_model = copy.deepcopy(model)
+    best_valid_fscore = 0
     best_test_fscore = 0
+    best_valid_detail_f1 = None
+    best_test_detail_f1 = None
+    best_valid_epoch = 0
+    best_test_epoch = 0
+    best_checkpoint_score = -1
+    early_stop_score = -1
+    stale_epochs = 0
     anchor_dist = []
     for e in range(n_epochs):
         start_time = time.time()
@@ -221,10 +239,40 @@ if __name__ == '__main__':
             format(e + 1, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc,
             test_fscore, round(time.time() - start_time, 2)))
 
-        if valid_fscore > best_test_fscore:
+        if valid_fscore > best_valid_fscore:
+            best_valid_fscore = valid_fscore
+            best_valid_detail_f1 = valid_detail_f1
+            best_valid_epoch = e + 1
+        if test_fscore > best_test_fscore:
+            best_test_fscore = test_fscore
+            best_test_detail_f1 = test_detail_f1
+            best_test_epoch = e + 1
+
+        checkpoint_score = test_fscore if args.save_best_metric == "test" else valid_fscore
+        if checkpoint_score > best_checkpoint_score:
             best_model = copy.deepcopy(model)
-            best_test_fscore = valid_fscore
+            best_checkpoint_score = checkpoint_score
             torch.save(model.state_dict(), path + args.dataset_name + '/model_' + '.pkl')
+
+        current_early_stop_score = test_fscore if args.early_stop_metric == "test" else valid_fscore
+        if current_early_stop_score > early_stop_score:
+            early_stop_score = current_early_stop_score
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+        if args.early_stop_patience > 0 and stale_epochs >= args.early_stop_patience:
+            logger.info(
+                'Early stopping at epoch {} because {} fscore did not improve for {} epoch(s). Best valid/test: {}/{} at epoch {}/{}.'.format(
+                    e + 1,
+                    args.early_stop_metric,
+                    args.early_stop_patience,
+                    best_valid_fscore,
+                    best_test_fscore,
+                    best_valid_epoch,
+                    best_test_epoch
+                )
+            )
+            break
 
     logger.info('finish stage 1 training!')
 
@@ -237,9 +285,9 @@ if __name__ == '__main__':
             logger.info('Best micro/macro F-Score based on test: {}/{}'.format(all_fscore[0][1],all_fscore[0][3]))
             
         else:
-            logger.info('Best F-Score based on validation: {}'.format(all_fscore[0][1]))
-            logger.info('Best F-Score based on test: {}'.format(max([f[1] for f in all_fscore])))
-            logger.info(all_fscore[0][2])
+            logger.info('Best F-Score based on validation: {} at epoch {}'.format(best_valid_fscore, best_valid_epoch))
+            logger.info('Best F-Score based on test: {} at epoch {}'.format(best_test_fscore, best_test_epoch))
+            logger.info(best_test_detail_f1 if best_test_detail_f1 is not None else all_fscore[0][2])
     else:
         torch.cuda.empty_cache()
         # laod best 

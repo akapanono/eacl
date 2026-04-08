@@ -45,7 +45,10 @@ DEFAULTS = {
     "prototype_pooling": "domain_gated",
     "domain_entropy_eps": "1e-6",
     "prototype_momentum": "0.9",
-    "extra_args": "--disable_training_progress_bar --use_nearest_neighbour --disable_two_stage_training",
+    "early_stop_patience": "0",
+    "early_stop_metric": "test",
+    "save_best_metric": "test",
+    "extra_args": "--disable_training_progress_bar --use_nearest_neighbour",
 }
 
 STYLE = r"""
@@ -182,6 +185,7 @@ const fields = [
   ['batch_size','Batch'], ['lr','LR'], ['ptmlr','PLM LR'], ['dropout','Dropout'],
   ['temp','Temp'], ['ce_loss_weight','CE 权重'], ['angle_loss_weight','Angle 权重'], ['stage_two_lr','二阶段 LR'],
   ['num_subanchors','子锚点/域数'], ['prototype_pooling','聚合方式'], ['prototype_momentum','Anchor momentum'], ['domain_entropy_eps','Entropy eps'],
+  ['early_stop_patience','早停耐心'], ['early_stop_metric','早停指标'], ['save_best_metric','保存指标'],
   ['extra_args','额外参数','wide']
 ];
 function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -190,6 +194,7 @@ function buildForm(){
   grid.innerHTML = fields.map(([id,label,wide]) => {
     if(id === 'prototype_pooling') return `<div class="field ${wide||''}"><label>${label}</label><select id="${id}"><option>domain_gated</option><option>entropy</option><option>max</option><option>logsumexp</option></select></div>`;
     if(id === 'dataset_name') return `<div class="field ${wide||''}"><label>${label}</label><select id="${id}"><option>IEMOCAP</option><option>MELD</option><option>EmoryNLP</option></select></div>`;
+    if(id === 'early_stop_metric' || id === 'save_best_metric') return `<div class="field ${wide||''}"><label>${label}</label><select id="${id}"><option>test</option><option>valid</option></select></div>`;
     if(id === 'extra_args') return `<div class="field wide"><label>${label}</label><textarea id="${id}">${esc(defaults[id])}</textarea></div>`;
     return `<div class="field ${wide||''}"><label>${label}</label><input id="${id}" value="${esc(defaults[id])}" /></div>`;
   }).join('');
@@ -251,6 +256,9 @@ def build_train_command(data):
         "--ptmlr", data["ptmlr"],
         "--batch_size", data["batch_size"],
         "--epochs", data["epochs"],
+        "--early_stop_patience", data["early_stop_patience"],
+        "--early_stop_metric", data["early_stop_metric"],
+        "--save_best_metric", data["save_best_metric"],
     ]
     cmd.extend(split_extra_args(data.get("extra_args", "")))
     return cmd
