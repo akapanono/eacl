@@ -2,6 +2,7 @@ import random
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -11,7 +12,13 @@ from pathlib import Path
 # =========================
 N_TRIALS = 20
 DATASET_NAME = "IEMOCAP"
-GPU_ID = 0
+GPU_IDS = [0]
+MAX_PARALLEL_JOBS = 1
+AUTO_SCHEDULE_BY_GPU = True
+GPU_UTIL_THRESHOLD = 90
+MIN_FREE_MEMORY_MB = 5000
+POLL_SECONDS = 15
+STOP_ON_ERROR = False
 
 ANCHOR_PATH = r".\emo_anchors\sup-simcse-roberta-large"
 BERT_PATH = r".\pretrained\sup-simcse-roberta-large"
@@ -83,7 +90,7 @@ def build_command(cfg):
         "--anchor_path", ANCHOR_PATH,
         "--bert_path", BERT_PATH,
         "--dataset_name", DATASET_NAME,
-        "--gpu_id", str(GPU_ID),
+        "--gpu_id", str(cfg["gpu_id"]),
         "--ce_loss_weight", fmt_float(cfg["ce_loss_weight"]),
         "--temp", fmt_float(cfg["temp"]),
         "--seed", str(cfg["seed"]),
@@ -155,7 +162,7 @@ def append_summary(row):
         "seed", "lr", "ptmlr", "dropout", "batch_size", "temp",
         "prototype_momentum", "ce_loss_weight", "angle_loss_weight",
         "domain_variant_pooling", "domain_variant_temp",
-        "disable_anchor_updates", "log",
+        "disable_anchor_updates", "gpu_id", "returncode", "log",
     ]
     exists = SUMMARY_FILE.exists()
     with SUMMARY_FILE.open("a", encoding="utf-8") as f:
@@ -166,72 +173,168 @@ def append_summary(row):
 
 def print_leaderboard(results, top_k=10):
     ranked = sorted(
-        [r for r in results if r["best_test"] is not None],
+        [r for r in results if r["best_test"] not in [None, ""] and r["returncode"] == 0],
         key=lambda r: r["best_test"],
         reverse=True,
     )
     print("\n========== Top Results ==========")
+    if not ranked:
+        print("No successful runs yet.")
+        return
     for idx, row in enumerate(ranked[:top_k], start=1):
         print(
             f"{idx:02d}. test={row['best_test']} epoch={row['best_test_epoch']} "
             f"seed={row['seed']} lr={row['lr']} dropout={row['dropout']} "
             f"bs={row['batch_size']} temp={row['temp']} mom={row['prototype_momentum']} "
             f"ce={row['ce_loss_weight']} angle={row['angle_loss_weight']} "
-            f"dv={row['domain_variant_pooling']} dvt={row['domain_variant_temp']} "
+            f"dv={row['domain_variant_pooling']} dvt={row['domain_variant_temp']} gpu={row['gpu_id']} "
             f"log={row['log']}"
         )
+
+
+def query_gpu_status():
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                f"--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+    except Exception:
+        return {}
+
+    status = {}
+    for line in output.strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 4:
+            continue
+        idx, util, mem_used, mem_total = map(int, parts)
+        status[idx] = {
+            "util": util,
+            "mem_used": mem_used,
+            "mem_total": mem_total,
+            "mem_free": mem_total - mem_used,
+        }
+    return status
+
+
+def can_launch_on_gpu(gpu_id, running_jobs):
+    if sum(1 for job in running_jobs if job["gpu_id"] == gpu_id) >= MAX_PARALLEL_JOBS:
+        return False
+    if not AUTO_SCHEDULE_BY_GPU:
+        return True
+    status = query_gpu_status().get(gpu_id)
+    if status is None:
+        return True
+    return status["util"] < GPU_UTIL_THRESHOLD and status["mem_free"] >= MIN_FREE_MEMORY_MB
+
+
+def start_job(cfg):
+    cmd = build_command(cfg)
+    log_path = make_log_path(cfg)
+    print("\n" + "=" * 90)
+    print(f"Trial {cfg['trial']}/{N_TRIALS} -> GPU {cfg['gpu_id']}")
+    print("Command:", subprocess.list2cmdline(cmd))
+    print("Log:", log_path)
+
+    log_file = log_path.open("w", encoding="utf-8", errors="replace")
+    log_file.write("# command: " + subprocess.list2cmdline(cmd) + "\n\n")
+    log_file.flush()
+    proc = subprocess.Popen(
+        cmd,
+        cwd=Path(__file__).resolve().parent,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return {
+        "cfg": cfg,
+        "proc": proc,
+        "log_path": log_path,
+        "log_file": log_file,
+        "gpu_id": cfg["gpu_id"],
+    }
+
+
+def finish_job(job):
+    proc = job["proc"]
+    proc.wait()
+    job["log_file"].flush()
+    job["log_file"].close()
+    log_text = job["log_path"].read_text(encoding="utf-8", errors="replace")
+    best_valid, best_valid_epoch, best_test, best_test_epoch = parse_result(log_text)
+    row = {
+        **job["cfg"],
+        "best_valid": best_valid if best_valid is not None else "",
+        "best_valid_epoch": best_valid_epoch,
+        "best_test": best_test if best_test is not None else "",
+        "best_test_epoch": best_test_epoch,
+        "log": str(job["log_path"]),
+        "returncode": proc.returncode,
+    }
+    return row
 
 
 def main():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     results = []
+    pending = []
+    running = []
 
-    print(f"Random sweep starts: {N_TRIALS} trial(s), dataset={DATASET_NAME}, gpu={GPU_ID}")
+    print(f"Random sweep starts: {N_TRIALS} trial(s), dataset={DATASET_NAME}, gpus={GPU_IDS}")
     print(f"Logs: {LOG_DIR.resolve()}")
     print(f"Summary: {SUMMARY_FILE.resolve()}")
+    print(
+        f"Parallel config: max_jobs_per_gpu={MAX_PARALLEL_JOBS}, "
+        f"auto_schedule={AUTO_SCHEDULE_BY_GPU}, util<th{GPU_UTIL_THRESHOLD}, free_mem>{MIN_FREE_MEMORY_MB}MB"
+    )
 
     for trial_id in range(1, N_TRIALS + 1):
         cfg = sample_config(trial_id)
-        cmd = build_command(cfg)
-        log_path = make_log_path(cfg)
+        cfg["gpu_id"] = GPU_IDS[(trial_id - 1) % len(GPU_IDS)]
+        pending.append(cfg)
 
-        print("\n" + "=" * 90)
-        print(f"Trial {trial_id}/{N_TRIALS}")
-        print("Command:", subprocess.list2cmdline(cmd))
-        print("Log:", log_path)
+    while pending or running:
+        launched = False
+        for gpu_id in GPU_IDS:
+            while pending and can_launch_on_gpu(gpu_id, running):
+                next_idx = next((idx for idx, cfg in enumerate(pending) if cfg["gpu_id"] == gpu_id), None)
+                if next_idx is None:
+                    break
+                cfg = pending.pop(next_idx)
+                running.append(start_job(cfg))
+                launched = True
+                if sum(1 for job in running if job["gpu_id"] == gpu_id) >= MAX_PARALLEL_JOBS:
+                    break
 
-        with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
-            log_file.write("# command: " + subprocess.list2cmdline(cmd) + "\n\n")
-            log_file.flush()
-            proc = subprocess.run(
-                cmd,
-                cwd=Path(__file__).resolve().parent,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                text=True,
+        finished = []
+        for job in running:
+            if job["proc"].poll() is not None:
+                finished.append(job)
+
+        for job in finished:
+            running.remove(job)
+            row = finish_job(job)
+            results.append(row)
+            append_summary(row)
+            print(
+                f"Done. returncode={row['returncode']}, "
+                f"best_valid={row['best_valid']}@{row['best_valid_epoch']}, "
+                f"best_test={row['best_test']}@{row['best_test_epoch']}"
             )
+            print_leaderboard(results, top_k=5)
+            if STOP_ON_ERROR and row["returncode"] != 0:
+                print("Stopping sweep because STOP_ON_ERROR=True and a run failed.")
+                pending.clear()
+                for still_running in running:
+                    still_running["proc"].terminate()
+                break
 
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-        best_valid, best_valid_epoch, best_test, best_test_epoch = parse_result(log_text)
-
-        row = {
-            **cfg,
-            "best_valid": best_valid if best_valid is not None else "",
-            "best_valid_epoch": best_valid_epoch,
-            "best_test": best_test if best_test is not None else "",
-            "best_test_epoch": best_test_epoch,
-            "log": str(log_path),
-            "returncode": proc.returncode,
-        }
-        results.append(row)
-        append_summary(row)
-
-        print(
-            f"Done. returncode={proc.returncode}, "
-            f"best_valid={row['best_valid']}@{row['best_valid_epoch']}, "
-            f"best_test={row['best_test']}@{row['best_test_epoch']}"
-        )
-        print_leaderboard(results, top_k=5)
+        if pending or running:
+            if not launched and not finished:
+                time.sleep(POLL_SECONDS)
 
     print_leaderboard(results, top_k=10)
 

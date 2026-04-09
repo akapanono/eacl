@@ -117,7 +117,7 @@ class CLModel(nn.Module):
             domain_features.append(adapter(mask_outputs).unsqueeze(1))
         domain_features = torch.cat(domain_features, dim=1)
         domain_variant_scores = self.score_func(
-            domain_features.unsqueeze(2),
+            domain_features.unsqueeze(2).unsqueeze(3),
             anchors.permute(1, 0, 2, 3).unsqueeze(0)
         )
         domain_scores = self.aggregate_domain_variants(domain_variant_scores)
