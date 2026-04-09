@@ -49,20 +49,12 @@ class CLModel(nn.Module):
         ).to(self.device)
 
         self.tokenizer = tokenizer
-        anchor_tensor = load_anchor_tensor(
-            args.anchor_path,
-            args.dataset_name,
-            args.num_subanchors,
-            args.domain_anchor_variants,
-        ).float()
-        if anchor_tensor.dim() == 3:
-            anchor_tensor = anchor_tensor.unsqueeze(2)
+        anchor_tensor = load_anchor_tensor(args.anchor_path, args.dataset_name, args.num_subanchors).float()
         self.register_buffer("emo_anchor", anchor_tensor.to(self.device))
         self.num_subanchors = self.emo_anchor.shape[1]
-        self.num_domain_variants = self.emo_anchor.shape[2]
         self.register_buffer(
             "emo_label",
-            torch.arange(self.num_classes, dtype=torch.long).repeat_interleave(self.num_subanchors * self.num_domain_variants).to(self.device)
+            torch.arange(self.num_classes, dtype=torch.long).repeat_interleave(self.num_subanchors).to(self.device)
         )
 
     def device(self):
@@ -92,23 +84,14 @@ class CLModel(nn.Module):
     def get_mapped_anchors(self):
         flat_anchor = self.emo_anchor.view(-1, self.dim)
         mapped = self.map_function(flat_anchor)
-        return mapped.view(self.num_classes, self.num_subanchors * self.num_domain_variants, -1)
+        return mapped.view(self.num_classes, self.num_subanchors, -1)
 
     def get_domain_mapped_anchors(self):
         domain_anchors = []
         for domain_id, adapter in enumerate(self.domain_adapters):
-            domain_anchor = self.emo_anchor[:, domain_id, :, :]
-            flat_anchor = domain_anchor.reshape(-1, self.dim)
-            mapped = adapter(flat_anchor).view(self.num_classes, self.num_domain_variants, -1)
-            domain_anchors.append(mapped.unsqueeze(1))
+            domain_anchor = self.emo_anchor[:, domain_id, :]
+            domain_anchors.append(adapter(domain_anchor).unsqueeze(1))
         return torch.cat(domain_anchors, dim=1)
-
-    def aggregate_domain_variants(self, scores):
-        if self.args.domain_variant_pooling == "max":
-            return scores.max(dim=-1)[0]
-        if self.args.domain_variant_pooling == "mean":
-            return scores.mean(dim=-1)
-        return torch.logsumexp(scores / self.args.domain_variant_temp, dim=-1)
 
     def domain_gated_scores(self, mask_outputs):
         anchors = self.get_domain_mapped_anchors()
@@ -116,17 +99,15 @@ class CLModel(nn.Module):
         for adapter in self.domain_adapters:
             domain_features.append(adapter(mask_outputs).unsqueeze(1))
         domain_features = torch.cat(domain_features, dim=1)
-        domain_variant_scores = self.score_func(
-            domain_features.unsqueeze(2).unsqueeze(3),
-            anchors.permute(1, 0, 2, 3).unsqueeze(0)
+        domain_scores = self.score_func(
+            domain_features.unsqueeze(2),
+            anchors.transpose(0, 1).unsqueeze(0)
         )
-        domain_scores = self.aggregate_domain_variants(domain_variant_scores)
         domain_logits = domain_scores / self.args.temp
         domain_probs = F.softmax(domain_logits, dim=-1)
         domain_weights = F.softmax(self.domain_gate(mask_outputs), dim=-1)
         fused_probs = (domain_weights.unsqueeze(-1) * domain_probs).sum(dim=1)
         self.last_emo_anchor = anchors
-        self.last_domain_variant_scores = domain_variant_scores.detach()
         self.last_domain_probs = domain_probs.detach()
         self.last_domain_weights = domain_weights.detach()
         return torch.log(fused_probs + self.eps), domain_features.mean(dim=1), anchors
@@ -141,30 +122,6 @@ class CLModel(nn.Module):
 
         raw_outputs = raw_outputs[valid_mask].detach()
         labels = labels[valid_mask].detach()
-        if self.args.prototype_pooling == "domain_gated":
-            mapped_anchors = self.get_domain_mapped_anchors().detach()
-            for class_id in labels.unique().tolist():
-                class_mask = labels == class_id
-                class_raw = raw_outputs[class_mask]
-                if class_raw.shape[0] == 0:
-                    continue
-                for domain_id, adapter in enumerate(self.domain_adapters):
-                    class_mapped = adapter(class_raw).detach()
-                    sims = self.score_func(
-                        class_mapped.unsqueeze(1),
-                        mapped_anchors[class_id, domain_id].unsqueeze(0)
-                    )
-                    assignments = sims.argmax(dim=-1)
-                    for variant_id in range(self.num_domain_variants):
-                        member_mask = assignments == variant_id
-                        if member_mask.sum().item() == 0:
-                            continue
-                        centroid = class_raw[member_mask].mean(dim=0)
-                        self.emo_anchor[class_id, domain_id, variant_id].mul_(self.args.prototype_momentum).add_(
-                            centroid * (1.0 - self.args.prototype_momentum)
-                        )
-            return
-
         mapped_outputs = self.map_function(raw_outputs).detach()
         mapped_anchors = self.get_mapped_anchors().detach()
 
@@ -181,7 +138,7 @@ class CLModel(nn.Module):
                 if member_mask.sum().item() == 0:
                     continue
                 centroid = class_raw[member_mask].mean(dim=0)
-                self.emo_anchor[class_id, subanchor_id, 0].mul_(self.args.prototype_momentum).add_(
+                self.emo_anchor[class_id, subanchor_id].mul_(self.args.prototype_momentum).add_(
                     centroid * (1.0 - self.args.prototype_momentum)
                 )
     
