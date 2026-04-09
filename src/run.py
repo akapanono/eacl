@@ -129,6 +129,9 @@ def get_parser():
     parser.add_argument("--prototype_momentum", type=float, default=0.9)
     parser.add_argument("--prototype_pooling", type=str, default="max", choices=["max", "logsumexp", "entropy", "domain_gated"])
     parser.add_argument("--domain_entropy_eps", type=float, default=1e-6)
+    parser.add_argument("--domain_anchor_variants", type=int, default=1)
+    parser.add_argument("--domain_variant_pooling", type=str, default="logsumexp", choices=["max", "mean", "logsumexp"])
+    parser.add_argument("--domain_variant_temp", type=float, default=0.2)
     parser.add_argument("--disable_anchor_updates", action="store_true")
     parser.add_argument("--early_stop_patience", type=int, default=0,
                         help="Stop stage 1 if the selected metric does not improve for N epochs. 0 disables early stopping.")

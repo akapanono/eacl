@@ -34,6 +34,9 @@ SAVE_BEST_METRIC = "test"
 NUM_SUBANCHORS = 4
 PROTOTYPE_POOLING = "domain_gated"
 DOMAIN_ENTROPY_EPS = 1e-6
+DOMAIN_ANCHOR_VARIANTS = 2
+DOMAIN_VARIANT_POOLINGS = ["logsumexp", "max", "mean"]
+DOMAIN_VARIANT_TEMPS = [0.1, 0.2, 0.3]
 
 USE_NEAREST_NEIGHBOUR = True
 DISABLE_TRAINING_PROGRESS_BAR = True
@@ -68,6 +71,8 @@ def sample_config(trial_id):
         "ce_loss_weight": random.choice(CE_LOSS_WEIGHTS),
         "angle_loss_weight": random.choice(ANGLE_LOSS_WEIGHTS),
         "disable_anchor_updates": random.choice(DISABLE_ANCHOR_UPDATES_CHOICES),
+        "domain_variant_pooling": random.choice(DOMAIN_VARIANT_POOLINGS),
+        "domain_variant_temp": random.choice(DOMAIN_VARIANT_TEMPS),
     }
 
 
@@ -87,6 +92,9 @@ def build_command(cfg):
         "--num_subanchors", str(NUM_SUBANCHORS),
         "--prototype_pooling", PROTOTYPE_POOLING,
         "--domain_entropy_eps", fmt_float(DOMAIN_ENTROPY_EPS),
+        "--domain_anchor_variants", str(DOMAIN_ANCHOR_VARIANTS),
+        "--domain_variant_pooling", cfg["domain_variant_pooling"],
+        "--domain_variant_temp", fmt_float(cfg["domain_variant_temp"]),
         "--prototype_momentum", fmt_float(cfg["prototype_momentum"]),
         "--dropout", fmt_float(cfg["dropout"]),
         "--lr", fmt_float(cfg["lr"]),
@@ -118,6 +126,8 @@ def make_log_path(cfg):
         f"mom{safe_tag(fmt_float(cfg['prototype_momentum']))}",
         f"ce{safe_tag(fmt_float(cfg['ce_loss_weight']))}",
         f"angle{safe_tag(fmt_float(cfg['angle_loss_weight']))}",
+        f"dv{cfg['domain_variant_pooling']}",
+        f"dvt{safe_tag(fmt_float(cfg['domain_variant_temp']))}",
         stamp,
     ]
     return LOG_DIR / ("_".join(parts) + ".log")
@@ -144,6 +154,7 @@ def append_summary(row):
         "trial", "best_test", "best_test_epoch", "best_valid", "best_valid_epoch",
         "seed", "lr", "ptmlr", "dropout", "batch_size", "temp",
         "prototype_momentum", "ce_loss_weight", "angle_loss_weight",
+        "domain_variant_pooling", "domain_variant_temp",
         "disable_anchor_updates", "log",
     ]
     exists = SUMMARY_FILE.exists()
@@ -166,6 +177,7 @@ def print_leaderboard(results, top_k=10):
             f"seed={row['seed']} lr={row['lr']} dropout={row['dropout']} "
             f"bs={row['batch_size']} temp={row['temp']} mom={row['prototype_momentum']} "
             f"ce={row['ce_loss_weight']} angle={row['angle_loss_weight']} "
+            f"dv={row['domain_variant_pooling']} dvt={row['domain_variant_temp']} "
             f"log={row['log']}"
         )
 

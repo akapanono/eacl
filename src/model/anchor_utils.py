@@ -337,22 +337,52 @@ def expand_templates(dataset_name, num_subanchors):
     return expanded
 
 
-def get_anchor_filename(dataset_name, num_subanchors):
+def expand_domain_templates(dataset_name, domain_anchor_variants):
+    base_templates = get_domain_subanchor_templates(dataset_name)
+    fallback_templates = get_subanchor_templates(dataset_name)
+    expanded = {}
+    for emotion, variants in base_templates.items():
+        per_domain = []
+        for domain_id, base_sentence in enumerate(variants):
+            domain_variants = [base_sentence]
+            for extra_idx in range(1, domain_anchor_variants):
+                fallback_idx = (domain_id + extra_idx - 1) % len(fallback_templates[emotion])
+                fallback_sentence = fallback_templates[emotion][fallback_idx]
+                domain_variants.append(
+                    f"{base_sentence} {fallback_sentence} This prototype focuses on the {DOMAIN_NAMES[domain_id]} aspect."
+                )
+            per_domain.append(domain_variants)
+        expanded[emotion] = per_domain
+    return expanded
+
+
+def get_anchor_filename(dataset_name, num_subanchors, domain_anchor_variants=1):
+    if domain_anchor_variants > 1:
+        return f"{dataset_name.lower()}_emo_{num_subanchors}x{domain_anchor_variants}.pt"
     return f"{dataset_name.lower()}_emo_{num_subanchors}.pt"
 
 
-def load_anchor_tensor(anchor_path, dataset_name, num_subanchors):
-    preferred = os.path.join(anchor_path, get_anchor_filename(dataset_name, num_subanchors))
+def load_anchor_tensor(anchor_path, dataset_name, num_subanchors, domain_anchor_variants=1):
+    preferred = os.path.join(anchor_path, get_anchor_filename(dataset_name, num_subanchors, domain_anchor_variants))
     if os.path.exists(preferred):
         anchors = torch.load(preferred, map_location="cpu")
     else:
-        if num_subanchors > 1:
+        legacy_variant = os.path.join(anchor_path, get_anchor_filename(dataset_name, num_subanchors))
+        if domain_anchor_variants > 1:
+            raise FileNotFoundError(
+                f"Missing anchor file: {preferred}. "
+                f"Please run `python src/generate_anchors.py --bert_path <model_path> --num_subanchors {num_subanchors} --domain_anchor_variants {domain_anchor_variants}` first."
+            )
+        if os.path.exists(legacy_variant):
+            anchors = torch.load(legacy_variant, map_location="cpu")
+        elif num_subanchors > 1:
             raise FileNotFoundError(
                 f"Missing anchor file: {preferred}. "
                 f"Please run `python src/generate_anchors.py --bert_path <model_path> --num_subanchors {num_subanchors}` first."
             )
-        legacy = os.path.join(anchor_path, f"{dataset_name.lower()}_emo.pt")
-        anchors = torch.load(legacy, map_location="cpu")
+        else:
+            legacy = os.path.join(anchor_path, f"{dataset_name.lower()}_emo.pt")
+            anchors = torch.load(legacy, map_location="cpu")
     if anchors.dim() == 2:
         anchors = anchors.unsqueeze(1)
     return anchors
