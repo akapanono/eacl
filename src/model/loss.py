@@ -70,7 +70,10 @@ class SupConLoss(nn.Module):
             emo_anchor = model.get_mapped_anchors()
         flat_anchor = emo_anchor.view(-1, emo_anchor.shape[-1])
         anchor_labels = model.emo_label.to(reps.device)
-        class_anchor = emo_anchor.mean(dim=1)
+        if emo_anchor.dim() == 4:
+            class_anchor = emo_anchor.mean(dim=(1, 2))
+        else:
+            class_anchor = emo_anchor.mean(dim=1)
         if return_representations:
             sentiment_labels = labels
             sentiment_representations = reps.detach()
