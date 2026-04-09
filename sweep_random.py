@@ -23,7 +23,7 @@ STOP_ON_ERROR = False
 ANCHOR_PATH = r".\emo_anchors\sup-simcse-roberta-large"
 BERT_PATH = r".\pretrained\sup-simcse-roberta-large"
 
-SEEDS = [1, 2, 3, 5, 7, 11, 21, 41, 77, 100, 123, 3407]
+SEEDS = [11, 21, 41, 77, 100, 123, 3407,9999]
 LRS = [2e-4, 3e-4, 4e-4, 6e-4]
 PTM_LRS = [1e-5]
 DROPOUTS = [0.05, 0.1, 0.2, 0.3]
