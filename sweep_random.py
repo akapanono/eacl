@@ -1,3 +1,4 @@
+import csv
 import random
 import re
 import subprocess
@@ -51,6 +52,7 @@ DISABLE_ANCHOR_UPDATES_CHOICES = [False]
 
 LOG_DIR = Path("sweep_logs")
 SUMMARY_FILE = LOG_DIR / "summary.tsv"
+SUMMARY_CSV_FILE = LOG_DIR / "summary.csv"
 
 
 BEST_TEST_RE = re.compile(r"Best F-Score based on test:\s*([0-9.]+)(?:\s*at epoch\s*([0-9]+))?")
@@ -151,16 +153,23 @@ def parse_result(log_text):
 
 def append_summary(row):
     header = [
+        "status", "start_time", "end_time", "duration_sec",
         "trial", "best_test", "best_test_epoch", "best_valid", "best_valid_epoch",
         "seed", "lr", "ptmlr", "dropout", "batch_size", "temp",
         "prototype_momentum", "ce_loss_weight", "angle_loss_weight",
-        "disable_anchor_updates", "gpu_id", "returncode", "log",
+        "disable_anchor_updates", "gpu_id", "returncode", "command", "log",
     ]
     exists = SUMMARY_FILE.exists()
     with SUMMARY_FILE.open("a", encoding="utf-8") as f:
         if not exists:
             f.write("\t".join(header) + "\n")
         f.write("\t".join(str(row.get(key, "")) for key in header) + "\n")
+    csv_exists = SUMMARY_CSV_FILE.exists()
+    with SUMMARY_CSV_FILE.open("a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=header)
+        if not csv_exists:
+            writer.writeheader()
+        writer.writerow({key: row.get(key, "") for key in header})
 
 
 def print_leaderboard(results, top_k=10):
@@ -226,13 +235,16 @@ def can_launch_on_gpu(gpu_id, running_jobs):
 def start_job(cfg):
     cmd = build_command(cfg)
     log_path = make_log_path(cfg)
+    command_text = subprocess.list2cmdline(cmd)
+    start_time = datetime.now()
     print("\n" + "=" * 90)
     print(f"Trial {cfg['trial']}/{N_TRIALS} -> GPU {cfg['gpu_id']}")
-    print("Command:", subprocess.list2cmdline(cmd))
+    print("Command:", command_text)
     print("Log:", log_path)
 
     log_file = log_path.open("w", encoding="utf-8", errors="replace")
-    log_file.write("# command: " + subprocess.list2cmdline(cmd) + "\n\n")
+    log_file.write("# start_time: " + start_time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+    log_file.write("# command: " + command_text + "\n\n")
     log_file.flush()
     proc = subprocess.Popen(
         cmd,
@@ -247,24 +259,33 @@ def start_job(cfg):
         "log_path": log_path,
         "log_file": log_file,
         "gpu_id": cfg["gpu_id"],
+        "command": command_text,
+        "start_time": start_time,
     }
 
 
 def finish_job(job):
     proc = job["proc"]
     proc.wait()
+    end_time = datetime.now()
     job["log_file"].flush()
     job["log_file"].close()
     log_text = job["log_path"].read_text(encoding="utf-8", errors="replace")
     best_valid, best_valid_epoch, best_test, best_test_epoch = parse_result(log_text)
+    duration = round((end_time - job["start_time"]).total_seconds(), 2)
     row = {
         **job["cfg"],
+        "status": "ok" if proc.returncode == 0 else "failed",
+        "start_time": job["start_time"].strftime("%Y-%m-%d %H:%M:%S"),
+        "end_time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "duration_sec": duration,
         "best_valid": best_valid if best_valid is not None else "",
         "best_valid_epoch": best_valid_epoch,
         "best_test": best_test if best_test is not None else "",
         "best_test_epoch": best_test_epoch,
         "log": str(job["log_path"]),
         "returncode": proc.returncode,
+        "command": job["command"],
     }
     return row
 
