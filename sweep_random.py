@@ -7,12 +7,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-
-# =========================
-# 你主要改这里就行
-# =========================
 N_TRIALS = 50
-DATASET_NAME = "IEMOCAP"
+DATASET_NAME = "MELD"
 GPU_IDS = [0]
 MAX_PARALLEL_JOBS = 1
 AUTO_SCHEDULE_BY_GPU = True
