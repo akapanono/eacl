@@ -7,8 +7,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# cd G:\xhy\eacl
+# conda activate eacl
+# powershell -ExecutionPolicy Bypass -File .\launch_sweep_background.ps1 -PythonExe "C:\Users\Administrator\miniconda3\envs\eacl\python.exe"
+
+
 N_TRIALS = 50
-DATASET_NAME = "MELD"
+DATASET_NAME = "EmoryNLP"
 GPU_IDS = [0]
 MAX_PARALLEL_JOBS = 1
 AUTO_SCHEDULE_BY_GPU = True
