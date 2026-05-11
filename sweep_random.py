@@ -62,6 +62,22 @@ BEST_TEST_RE = re.compile(r"Best F-Score based on test:\s*([0-9.]+)(?:\s*at epoc
 BEST_VALID_RE = re.compile(r"Best F-Score based on validation:\s*([0-9.]+)(?:\s*at epoch\s*([0-9]+))?")
 
 
+def ensure_anchor_file():
+    anchor_file = Path(ANCHOR_PATH) / f"{DATASET_NAME.lower()}_emo_{NUM_SUBANCHORS}.pt"
+    if anchor_file.exists():
+        return
+    print(f"Missing anchor file: {anchor_file}")
+    print(f"Generating anchors with num_subanchors={NUM_SUBANCHORS} ...")
+    subprocess.check_call([
+        sys.executable,
+        "src/generate_anchors.py",
+        "--bert_path",
+        BERT_PATH,
+        "--num_subanchors",
+        str(NUM_SUBANCHORS),
+    ])
+
+
 def fmt_float(value):
     return f"{value:g}"
 
@@ -295,6 +311,7 @@ def finish_job(job):
 
 def main():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_anchor_file()
     results = []
     pending = []
     running = []
