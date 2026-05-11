@@ -12,7 +12,9 @@ from pathlib import Path
 # powershell -ExecutionPolicy Bypass -File .\launch_sweep_background.ps1 -PythonExe "C:\Users\Administrator\miniconda3\envs\eacl\python.exe"
 
 
-N_TRIALS = 50
+# Focused EmoryNLP sweep. The search space is intentionally narrower than a
+# broad random sweep because EmoryNLP is label-imbalanced and tends to overfit.
+N_TRIALS = 40
 DATASET_NAME = "EmoryNLP"
 GPU_IDS = [0]
 MAX_PARALLEL_JOBS = 1
@@ -22,23 +24,23 @@ MIN_FREE_MEMORY_MB = 5000
 POLL_SECONDS = 15
 STOP_ON_ERROR = False
 
-ANCHOR_PATH = r".\emo_anchors\sup-simcse-roberta-large"
-BERT_PATH = r".\pretrained\sup-simcse-roberta-large"
+ANCHOR_PATH = str(Path("emo_anchors") / "sup-simcse-roberta-large")
+BERT_PATH = str(Path("pretrained") / "sup-simcse-roberta-large")
 
-SEEDS = [77, 100, 123, 3407,9999,13029,1312,423,346,958]
-LRS = [2e-4, 3e-4, 4e-4, 6e-4]
+SEEDS = [77, 100, 123, 3407, 9999, 13029]
+LRS = [1e-4, 2e-4, 3e-4, 4e-4]
 PTM_LRS = [1e-5]
-DROPOUTS = [0.05, 0.1, 0.15, 0.2]
-BATCH_SIZES = [8, 16,32]
-TEMPS = [0.07, 0.1, 0.2]
-PROTOTYPE_MOMENTUMS = [0.8, 0.9, 0.95, 0.99]
-CE_LOSS_WEIGHTS = [0.05, 0.1, 0.2, 0.3]
+DROPOUTS = [0.1, 0.15, 0.2, 0.25]
+BATCH_SIZES = [8, 16]
+TEMPS = [0.1, 0.2, 0.3]
+PROTOTYPE_MOMENTUMS = [0.9, 0.95, 0.98, 0.99]
+CE_LOSS_WEIGHTS = [0.1, 0.2, 0.3]
 ANGLE_LOSS_WEIGHTS = [0.05, 0.1, 0.2]
 
-EPOCHS = 20
-EARLY_STOP_PATIENCE = 3
-EARLY_STOP_METRIC = "test"
-SAVE_BEST_METRIC = "test"
+EPOCHS = 30
+EARLY_STOP_PATIENCE = 5
+EARLY_STOP_METRIC = "valid"
+SAVE_BEST_METRIC = "valid"
 
 NUM_SUBANCHORS = 4
 PROTOTYPE_POOLING = "domain_gated"
