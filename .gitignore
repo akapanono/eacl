@@ -10,11 +10,22 @@ cache/
 
 output.log
 *.log
+sweep_logs/
 
 *.pt
 *.pkl
 *.bin
 *.msgpack
+
+# Paper writing materials and generated document artifacts
+docs/
+*.docx
+*.xlsx
+.tmp_*/
+.tmp_*.zip
+scripts/export_experiment_docx.py
+scripts/export_method_docx.py
+scripts/align_formula_docx.py
 
 .DS_Store
 Thumbs.db
