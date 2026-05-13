@@ -14,7 +14,7 @@ from pathlib import Path
 
 # Focused EmoryNLP sweep. The search space is intentionally narrower than a
 # broad random sweep because EmoryNLP is label-imbalanced and tends to overfit.
-N_TRIALS = 40
+N_TRIALS = 100
 DATASET_NAME = "EmoryNLP"
 GPU_IDS = [0]
 MAX_PARALLEL_JOBS = 1
@@ -27,11 +27,11 @@ STOP_ON_ERROR = False
 ANCHOR_PATH = str(Path("emo_anchors") / "sup-simcse-roberta-large")
 BERT_PATH = str(Path("pretrained") / "sup-simcse-roberta-large")
 
-SEEDS = [77, 100, 123, 3407, 9999, 13029]
-LRS = [1e-4, 2e-4, 3e-4, 4e-4]
+SEEDS = [49,4668,12334,4998,5684]
+LRS = [1e-4, 2e-4, 3e-4, 4e-4,1e-5]
 PTM_LRS = [1e-5]
-DROPOUTS = [0.1, 0.15, 0.2, 0.25]
-BATCH_SIZES = [8, 16]
+DROPOUTS = [0.1, 0.15, 0.2, 0.25,0.18,0.3]
+BATCH_SIZES = [8, 16,32]
 TEMPS = [0.1, 0.2, 0.3]
 PROTOTYPE_MOMENTUMS = [0.9, 0.95, 0.98, 0.99]
 CE_LOSS_WEIGHTS = [0.1, 0.2, 0.3]
