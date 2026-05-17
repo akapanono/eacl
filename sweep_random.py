@@ -11,11 +11,8 @@ from pathlib import Path
 # conda activate eacl
 # powershell -ExecutionPolicy Bypass -File .\launch_sweep_background.ps1 -PythonExe "C:\Users\Administrator\miniconda3\envs\eacl\python.exe"
 
-
-# Focused EmoryNLP sweep. The search space is intentionally narrower than a
-# broad random sweep because EmoryNLP is label-imbalanced and tends to overfit.
 N_TRIALS = 100
-DATASET_NAME = "EmoryNLP"
+DATASET_NAME = "MELD"
 GPU_IDS = [0]
 MAX_PARALLEL_JOBS = 1
 AUTO_SCHEDULE_BY_GPU = True
