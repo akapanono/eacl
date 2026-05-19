@@ -15,7 +15,8 @@ class HybridLossOutput:
     max_cosine:torch.Tensor = None
 
 def loss_function(log_prob, reps, raw_reps, label, mask, model):
-    ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-1).to(reps.device)
+    class_weights = getattr(model, "ce_class_weights", None)
+    ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-1, weight=class_weights).to(reps.device)
     scl_loss_fn = SupConLoss(model.args)
     cl_loss = scl_loss_fn(reps, label, model, return_representations=not model.training)
     ce_loss = ce_loss_fn(log_prob[mask], label[mask])

@@ -46,6 +46,8 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2)
             if batch_id % args.accumulation_step == 0:
                 optimizer.step()
+                if lr_scheduler is not None and getattr(args, "lr_scheduler", "step") != "step":
+                    lr_scheduler.step()
                 optimizer.zero_grad()
         else:
             sentiment_representations.append(loss_output.sentiment_representations)

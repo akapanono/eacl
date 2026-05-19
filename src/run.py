@@ -2,6 +2,7 @@ import os
 import numpy as np, argparse, time, pickle, random
 import torch
 import torch.nn as nn
+import math
 from trainer.trainer import  train_or_eval_model, retrain
 from dataset import DialogueDataset
 from torch.utils.data import DataLoader, sampler, TensorDataset
@@ -77,6 +78,33 @@ def get_paramsgroup(model, warmup=False):
     params = sorted(params, key=lambda x: x['lr'])
     return params
 
+def build_lr_scheduler(optimizer, args, train_loader):
+    if args.lr_scheduler == "step":
+        return torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=args.step_lr_size,
+            gamma=args.step_lr_gamma,
+            last_epoch=-1,
+        )
+
+    steps_per_epoch = math.ceil(len(train_loader) / max(1, args.accumulation_step))
+    total_steps = max(1, steps_per_epoch * args.epochs)
+    warmup_steps = int(total_steps * args.warmup_ratio)
+
+    def lr_lambda(current_step):
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return float(current_step + 1) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+def compute_class_weights(labels, n_classes, device):
+    counts = torch.bincount(labels[labels >= 0], minlength=n_classes).float()
+    counts = counts.clamp_min(1.0)
+    weights = counts.sum() / (n_classes * counts)
+    return weights.to(device)
+
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bert_path', type=str, default='./pretrained/sup-simcse-roberta-large')
@@ -110,6 +138,16 @@ def get_parser():
     parser.add_argument('--epochs', type=int, default=8, metavar='E', help='number of epochs')
 
     parser.add_argument('--weight_decay', type=float, default=0, help='type of nodal attention')
+    parser.add_argument("--lr_scheduler", type=str, default="step", choices=["step", "cosine"],
+                        help="Learning-rate schedule. The default keeps the original StepLR behavior.")
+    parser.add_argument("--step_lr_size", type=int, default=1,
+                        help="StepLR decay interval. Default 1 preserves the original behavior.")
+    parser.add_argument("--step_lr_gamma", type=float, default=0.5,
+                        help="StepLR decay factor. Default 0.5 preserves the original behavior.")
+    parser.add_argument("--warmup_ratio", type=float, default=0.0,
+                        help="Warmup ratio used by the cosine scheduler.")
+    parser.add_argument("--class_balanced_ce", action="store_true",
+                        help="Use inverse-frequency class weights in cross entropy.")
     ### Environment params
     parser.add_argument("--fp16", type=bool, default=True)
     parser.add_argument("--seed", type=int, default=2)
@@ -201,12 +239,15 @@ if __name__ == '__main__':
         model.f_context_encoder.gradient_checkpointing_enable()
     device = f"cuda:{args.gpu_id}" if args.cuda else "cpu"
     model = model.to(device)
+    if args.class_balanced_ce:
+        model.ce_class_weights = compute_class_weights(trainset.labels, n_classes, device)
+        logger.info("class-balanced CE weights: {}".format(model.ce_class_weights.detach().cpu().tolist()))
+    else:
+        model.ce_class_weights = None
     # loss_function = FocalLoss(alpha=0.75).to(device)
-    num_training_steps = 1
-    num_warmup_steps = 0
     optimizer = AdamW(get_paramsgroup(model.module if hasattr(model, 'module') else model))
 
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5, last_epoch=-1)
+    lr_scheduler = build_lr_scheduler(optimizer, args, train_loader)
     best_fscore,best_acc, best_loss, best_label, best_pred, best_mask = None,None, None, None, None, None
     all_fscore, all_acc, all_loss = [], [], []
     best_acc = 0.
@@ -228,7 +269,8 @@ if __name__ == '__main__':
         
         train_loss, train_acc, _, _, train_fscore, train_detail_f1, max_cosine  = \
             train_or_eval_model(model, loss_function, train_loader, e, device, args, optimizer, lr_scheduler, True)
-        lr_scheduler.step()
+        if args.lr_scheduler == "step":
+            lr_scheduler.step()
         valid_loss, valid_acc, _, _, valid_fscore, valid_detail_f1, _ = \
             train_or_eval_model(model, loss_function, valid_loader, e, device, args)
         test_loss, test_acc, test_label, test_pred, test_fscore, test_detail_f1, _ = \
@@ -352,11 +394,13 @@ if __name__ == '__main__':
         clf = Classifier(args, anchors).to(device)
         optimizer = torch.optim.Adam(clf.parameters(), lr=args.stage_two_lr, weight_decay=args.weight_decay)
         best_valid_score = 0
+        class_weights = model.ce_class_weights if args.class_balanced_ce else None
+        stage_two_loss = nn.CrossEntropyLoss(ignore_index=-1, weight=class_weights).to(device)
         for e in range(10):
-            train_loss, train_ce_loss, train_acc, _, _, train_fscore, train_detail_f1 = retrain(clf, nn.CrossEntropyLoss(ignore_index=-1).to(device), train_loader, e, device, args, optimizer, train=True)
+            train_loss, train_ce_loss, train_acc, _, _, train_fscore, train_detail_f1 = retrain(clf, stage_two_loss, train_loader, e, device, args, optimizer, train=True)
             
-            valid_loss, valid_ce_loss,  valid_acc, _, _, valid_fscore, valid_detail_f1  = retrain(clf, nn.CrossEntropyLoss(ignore_index=-1).to(device), valid_loader, e, device, args, optimizer, train=False)
-            test_loss, test_ce_loss,  test_acc, test_label, test_pred, test_fscore, test_detail_f1 = retrain(clf, nn.CrossEntropyLoss(ignore_index=-1).to(device), test_loader, e, device, args, optimizer, train=False)
+            valid_loss, valid_ce_loss,  valid_acc, _, _, valid_fscore, valid_detail_f1  = retrain(clf, stage_two_loss, valid_loader, e, device, args, optimizer, train=False)
+            test_loss, test_ce_loss,  test_acc, test_label, test_pred, test_fscore, test_detail_f1 = retrain(clf, stage_two_loss, test_loader, e, device, args, optimizer, train=False)
             
             logger.info( 'Epoch: {}, train_loss: {}, train_ce_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_ce_loss:{}, test_acc: {}, test_fscore: {}'. \
                     format(e + 1, train_loss, train_ce_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_ce_loss, test_acc, test_fscore))

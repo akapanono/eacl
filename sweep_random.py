@@ -20,19 +20,25 @@ GPU_UTIL_THRESHOLD = 90
 MIN_FREE_MEMORY_MB = 5000
 POLL_SECONDS = 15
 STOP_ON_ERROR = False
+USE_IMPROVED_TRAINING = True
 
 ANCHOR_PATH = str(Path("emo_anchors") / "sup-simcse-roberta-large")
 BERT_PATH = str(Path("pretrained") / "sup-simcse-roberta-large")
 
 SEEDS = [49,4668,12334,4998,5684]
-LRS = [1e-4, 2e-4, 3e-4, 4e-4,1e-5]
-PTM_LRS = [1e-5]
+LRS = [5e-5, 1e-4, 2e-4, 3e-4]
+PTM_LRS = [5e-6, 8e-6, 1e-5, 1.5e-5, 2e-5]
 DROPOUTS = [0.1, 0.15, 0.2, 0.25,0.18,0.3]
 BATCH_SIZES = [8, 16,32]
 TEMPS = [0.1, 0.2, 0.3]
 PROTOTYPE_MOMENTUMS = [0.9, 0.95, 0.98, 0.99]
-CE_LOSS_WEIGHTS = [0.1, 0.2, 0.3]
+CE_LOSS_WEIGHTS = [0.3, 0.4, 0.5, 0.6]
 ANGLE_LOSS_WEIGHTS = [0.05, 0.1, 0.2]
+LR_SCHEDULER = "cosine"
+WARMUP_RATIO = 0.08
+STEP_LR_SIZE = 5
+STEP_LR_GAMMA = 0.8
+CLASS_BALANCED_CE = True
 
 EPOCHS = 30
 EARLY_STOP_PATIENCE = 5
@@ -40,7 +46,7 @@ EARLY_STOP_METRIC = "valid"
 SAVE_BEST_METRIC = "valid"
 
 NUM_SUBANCHORS = 4
-PROTOTYPE_POOLING = "domain_gated"
+PROTOTYPE_POOLINGS = ["domain_gated", "logsumexp", "max"]
 DOMAIN_ENTROPY_EPS = 1e-6
 DOMAIN_ANCHOR_VARIANTS = 1
 DOMAIN_VARIANT_POOLINGS = ["logsumexp"]
@@ -48,7 +54,19 @@ DOMAIN_VARIANT_TEMPS = [0.2]
 
 USE_NEAREST_NEIGHBOUR = True
 DISABLE_TRAINING_PROGRESS_BAR = True
-DISABLE_ANCHOR_UPDATES_CHOICES = [False]
+DISABLE_ANCHOR_UPDATES_CHOICES = [False, True]
+
+if not USE_IMPROVED_TRAINING:
+    LRS = [1e-4, 2e-4, 3e-4, 4e-4, 1e-5]
+    PTM_LRS = [1e-5]
+    CE_LOSS_WEIGHTS = [0.1, 0.2, 0.3]
+    LR_SCHEDULER = "step"
+    WARMUP_RATIO = 0.0
+    STEP_LR_SIZE = 1
+    STEP_LR_GAMMA = 0.5
+    CLASS_BALANCED_CE = False
+    PROTOTYPE_POOLINGS = ["domain_gated"]
+    DISABLE_ANCHOR_UPDATES_CHOICES = [False]
 
 LOG_DIR = Path("sweep_logs")
 SUMMARY_FILE = LOG_DIR / "summary.tsv"
@@ -95,6 +113,7 @@ def sample_config(trial_id):
         "prototype_momentum": random.choice(PROTOTYPE_MOMENTUMS),
         "ce_loss_weight": random.choice(CE_LOSS_WEIGHTS),
         "angle_loss_weight": random.choice(ANGLE_LOSS_WEIGHTS),
+        "prototype_pooling": random.choice(PROTOTYPE_POOLINGS),
         "disable_anchor_updates": random.choice(DISABLE_ANCHOR_UPDATES_CHOICES),
     }
 
@@ -113,7 +132,7 @@ def build_command(cfg):
         "--angle_loss_weight", fmt_float(cfg["angle_loss_weight"]),
         "--stage_two_lr", "1e-4",
         "--num_subanchors", str(NUM_SUBANCHORS),
-        "--prototype_pooling", PROTOTYPE_POOLING,
+        "--prototype_pooling", cfg["prototype_pooling"],
         "--domain_entropy_eps", fmt_float(DOMAIN_ENTROPY_EPS),
         "--prototype_momentum", fmt_float(cfg["prototype_momentum"]),
         "--dropout", fmt_float(cfg["dropout"]),
@@ -121,6 +140,10 @@ def build_command(cfg):
         "--ptmlr", fmt_float(cfg["ptmlr"]),
         "--batch_size", str(cfg["batch_size"]),
         "--epochs", str(EPOCHS),
+        "--lr_scheduler", LR_SCHEDULER,
+        "--step_lr_size", str(STEP_LR_SIZE),
+        "--step_lr_gamma", fmt_float(STEP_LR_GAMMA),
+        "--warmup_ratio", fmt_float(WARMUP_RATIO),
         "--early_stop_patience", str(EARLY_STOP_PATIENCE),
         "--early_stop_metric", EARLY_STOP_METRIC,
         "--save_best_metric", SAVE_BEST_METRIC,
@@ -129,6 +152,8 @@ def build_command(cfg):
         cmd.append("--disable_training_progress_bar")
     if USE_NEAREST_NEIGHBOUR:
         cmd.append("--use_nearest_neighbour")
+    if CLASS_BALANCED_CE:
+        cmd.append("--class_balanced_ce")
     if cfg["disable_anchor_updates"]:
         cmd.append("--disable_anchor_updates")
     return cmd
@@ -143,6 +168,7 @@ def make_log_path(cfg):
         f"drop{safe_tag(fmt_float(cfg['dropout']))}",
         f"bs{cfg['batch_size']}",
         f"temp{safe_tag(fmt_float(cfg['temp']))}",
+        f"pool{cfg['prototype_pooling']}",
         f"mom{safe_tag(fmt_float(cfg['prototype_momentum']))}",
         f"ce{safe_tag(fmt_float(cfg['ce_loss_weight']))}",
         f"angle{safe_tag(fmt_float(cfg['angle_loss_weight']))}",
@@ -172,7 +198,8 @@ def append_summary(row):
         "status", "start_time", "end_time", "duration_sec",
         "trial", "best_test", "best_test_epoch", "best_valid", "best_valid_epoch",
         "seed", "lr", "ptmlr", "dropout", "batch_size", "temp",
-        "prototype_momentum", "ce_loss_weight", "angle_loss_weight",
+        "prototype_pooling", "prototype_momentum", "ce_loss_weight", "angle_loss_weight",
+        "lr_scheduler", "warmup_ratio", "class_balanced_ce",
         "disable_anchor_updates", "gpu_id", "returncode", "command", "log",
     ]
     exists = SUMMARY_FILE.exists()
@@ -202,7 +229,8 @@ def print_leaderboard(results, top_k=10):
         print(
             f"{idx:02d}. test={row['best_test']} epoch={row['best_test_epoch']} "
             f"seed={row['seed']} lr={row['lr']} dropout={row['dropout']} "
-            f"bs={row['batch_size']} temp={row['temp']} mom={row['prototype_momentum']} "
+            f"bs={row['batch_size']} temp={row['temp']} pool={row['prototype_pooling']} "
+            f"mom={row['prototype_momentum']} "
             f"ce={row['ce_loss_weight']} angle={row['angle_loss_weight']} "
             f"gpu={row['gpu_id']} "
             f"log={row['log']}"
@@ -299,6 +327,9 @@ def finish_job(job):
         "best_valid_epoch": best_valid_epoch,
         "best_test": best_test if best_test is not None else "",
         "best_test_epoch": best_test_epoch,
+        "lr_scheduler": LR_SCHEDULER,
+        "warmup_ratio": WARMUP_RATIO,
+        "class_balanced_ce": CLASS_BALANCED_CE,
         "log": str(job["log_path"]),
         "returncode": proc.returncode,
         "command": job["command"],
@@ -319,6 +350,11 @@ def main():
     print(
         f"Parallel config: max_jobs_per_gpu={MAX_PARALLEL_JOBS}, "
         f"auto_schedule={AUTO_SCHEDULE_BY_GPU}, util<th{GPU_UTIL_THRESHOLD}, free_mem>{MIN_FREE_MEMORY_MB}MB"
+    )
+    print(
+        f"Training config: improved={USE_IMPROVED_TRAINING}, scheduler={LR_SCHEDULER}, "
+        f"warmup={WARMUP_RATIO}, class_balanced_ce={CLASS_BALANCED_CE}, "
+        f"poolings={PROTOTYPE_POOLINGS}"
     )
 
     for trial_id in range(1, N_TRIALS + 1):
