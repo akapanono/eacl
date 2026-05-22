@@ -1,0 +1,56 @@
+# Stable SAS-NSG-EACL reference settings.
+# This project still uses argparse; treat this file as an experiment record
+# and translate the values into command-line arguments.
+
+model: SAS-NSG-EACL
+
+learning_rate:
+  lr: 5e-5
+  ptmlr: 5e-6
+  warmup_ratio: 0.1
+  lr_scheduler: cosine
+  max_grad_norm: 1.0
+  fp16: false
+
+modules:
+  use_neutral_decoupling: true
+  use_speaker_state: true
+  use_similar_anchor_separation: true
+  use_hard_anchor_negative: true
+  use_state_fusion: true
+  use_state_in_domain_gate: true
+
+loss:
+  lambda_neu: 0.2
+  lambda_supcon: 0.2
+  lambda_angle: 0.01
+  lambda_sas: 0.005
+  lambda_hard: 0.01
+  lambda_gate_entropy: 0.001
+
+similar_anchor_separation:
+  similar_emotion_pairs:
+    - [happy, excited]
+    - [sad, frustrated]
+    - [angry, frustrated]
+  sas_margin: 0.30
+
+hard_anchor_negative:
+  hard_negative_rho: 1.0
+  hard_negative_temperature: 0.1
+
+prototypes:
+  prototype_pooling: domain_gated
+  num_subanchors: 4
+  prototype_momentum: 0.99
+  freeze_prototype_epochs: 2
+  normalize_prototypes_after_update: true
+
+fallback_if_nan:
+  lambda_sas: 0.002
+  lambda_hard: 0.005
+  hard_negative_temperature: 0.2
+  hard_negative_rho: 0.5
+  max_grad_norm: 0.5
+  prototype_momentum: 0.995
+  freeze_prototype_epochs: 3

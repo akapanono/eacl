@@ -7,7 +7,7 @@ model: SAS-NSG-EACL
 neutral_decoupling:
   use_neutral_decoupling: true
   neutral_label_name: neutral
-  lambda_neu: 0.5
+  lambda_neu: 0.2
 
 speaker_state_guidance:
   use_speaker_state: true
@@ -29,14 +29,22 @@ similar_anchor_separation:
     - [sad, frustrated]
     - [angry, frustrated]
   sas_margin: 0.30
-  lambda_sas: 0.02
+  lambda_sas: 0.005
 
 hard_anchor_negative:
   use_hard_anchor_negative: true
-  hard_negative_rho: 2.0
-  hard_negative_temperature: 0.07
-  lambda_hard: 0.05
+  hard_negative_rho: 1.0
+  hard_negative_temperature: 0.1
+  lambda_hard: 0.01
 
 loss:
-  lambda_supcon: 1.0
-  lambda_angle: 0.05
+  lambda_supcon: 0.2
+  lambda_angle: 0.01
+  lambda_gate_entropy: 0.001
+
+stability:
+  fp16: false
+  max_grad_norm: 1.0
+  prototype_momentum: 0.99
+  freeze_prototype_epochs: 2
+  normalize_prototypes_after_update: true

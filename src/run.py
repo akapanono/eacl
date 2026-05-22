@@ -116,11 +116,12 @@ def get_parser():
     parser.add_argument('--wf', type=int, default=0, help='future window size')
     parser.add_argument("--ce_loss_weight", type=float, default=0.1)
     parser.add_argument("--angle_loss_weight", type=float, default=1.0)
-    parser.add_argument("--lambda_neu", type=float, default=0.5)
-    parser.add_argument("--lambda_supcon", type=float, default=1.0)
-    parser.add_argument("--lambda_angle", type=float, default=0.05)
-    parser.add_argument("--lambda_sas", type=float, default=0.02)
-    parser.add_argument("--lambda_hard", type=float, default=0.05)
+    parser.add_argument("--lambda_neu", type=float, default=0.2)
+    parser.add_argument("--lambda_supcon", type=float, default=0.2)
+    parser.add_argument("--lambda_angle", type=float, default=0.01)
+    parser.add_argument("--lambda_sas", type=float, default=0.005)
+    parser.add_argument("--lambda_hard", type=float, default=0.01)
+    parser.add_argument("--lambda_gate_entropy", type=float, default=0.001)
     parser.add_argument('--max_len', type=int, default=256,
                         help='max content length for each text, if set to 0, then the max length has no constrain')
     parser.add_argument("--temp", type=float, default=0.5)
@@ -130,7 +131,7 @@ def get_parser():
 
     parser.add_argument('--dataset_name', default='IEMOCAP', type= str, help='dataset name, IEMOCAP or MELD or EmoryNLP')
 
-    parser.add_argument('--max_grad_norm', type=float, default=5.0, help='Gradient clipping.')
+    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Gradient clipping.')
 
     parser.add_argument('--lr', type=float, default=4e-4, metavar='LR', help='learning rate')
 
@@ -164,7 +165,8 @@ def get_parser():
     parser.add_argument("--use_state_in_domain_gate", action="store_true", default=True)
     parser.add_argument("--disable_state_in_domain_gate", action="store_true")
     ### Environment params
-    parser.add_argument("--fp16", type=bool, default=True)
+    parser.add_argument("--fp16", action="store_true", default=False,
+                        help="Use autocast mixed precision. Disabled by default for numerical stability.")
     parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--ignore_prompt_prefix", action="store_true", default=True)
     parser.add_argument("--disable_training_progress_bar", action="store_true")
@@ -179,16 +181,19 @@ def get_parser():
     parser.add_argument("--stage_two_lr", default=1e-4, type=float)
     parser.add_argument("--anchor_path", type=str)
     parser.add_argument("--num_subanchors", type=int, default=1)
-    parser.add_argument("--prototype_momentum", type=float, default=0.9)
+    parser.add_argument("--prototype_momentum", type=float, default=0.99)
     parser.add_argument("--prototype_pooling", type=str, default="max", choices=["max", "logsumexp", "entropy", "domain_gated"])
     parser.add_argument("--domain_entropy_eps", type=float, default=1e-6)
     parser.add_argument("--disable_anchor_updates", action="store_true")
+    parser.add_argument("--freeze_prototype_epochs", type=int, default=2)
+    parser.add_argument("--normalize_prototypes_after_update", action="store_true", default=True)
+    parser.add_argument("--disable_prototype_normalization", action="store_true")
     parser.add_argument("--use_similar_anchor_separation", action="store_true")
     parser.add_argument("--use_hard_anchor_negative", action="store_true")
     parser.add_argument("--similar_emotion_pairs", type=str, default="happy:excited,sad:frustrated,angry:frustrated")
     parser.add_argument("--sas_margin", type=float, default=0.30)
-    parser.add_argument("--hard_negative_rho", type=float, default=2.0)
-    parser.add_argument("--hard_negative_temperature", type=float, default=0.07)
+    parser.add_argument("--hard_negative_rho", type=float, default=1.0)
+    parser.add_argument("--hard_negative_temperature", type=float, default=0.1)
     parser.add_argument("--early_stop_patience", type=int, default=0,
                         help="Stop stage 1 if the selected metric does not improve for N epochs. 0 disables early stopping.")
     parser.add_argument("--early_stop_metric", type=str, default="test", choices=["valid", "test"],
@@ -197,6 +202,8 @@ def get_parser():
                         help="Metric used to save the stage-1 checkpoint.")
     parser.add_argument("--force_two_stage", action="store_true",
                         help="Force stage-2 training even for domain-aware pooling modes.")
+    parser.add_argument("--debug_finite_checks", action="store_true",
+                        help="Check model parameters and buffers for NaN/Inf after optimizer steps.")
     
     # analysis
     parser.add_argument("--save_stage_two_cache", action="store_true")
@@ -207,6 +214,8 @@ def get_parser():
         args.use_state_fusion = False
     if args.disable_state_in_domain_gate:
         args.use_state_in_domain_gate = False
+    if args.disable_prototype_normalization:
+        args.normalize_prototypes_after_update = False
     return args
 
 if __name__ == '__main__':
@@ -389,6 +398,13 @@ if __name__ == '__main__':
                             state_attention_mask=state_attention_mask,
                             return_mask_output=True,
                         ) 
+                else:
+                    log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(
+                        input_ids,
+                        state_input_ids=state_input_ids,
+                        state_attention_mask=state_attention_mask,
+                        return_mask_output=True,
+                    )
                 emb_train.append(masked_mapped_output.detach().cpu())
                 label_train.append(label.cpu())
             emb_train = torch.cat(emb_train, dim=0)
@@ -411,6 +427,13 @@ if __name__ == '__main__':
                             state_attention_mask=state_attention_mask,
                             return_mask_output=True,
                         ) 
+                else:
+                    log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(
+                        input_ids,
+                        state_input_ids=state_input_ids,
+                        state_attention_mask=state_attention_mask,
+                        return_mask_output=True,
+                    )
                 emb_val.append(masked_mapped_output.detach().cpu())
                 label_val.append(label.cpu())
             emb_val = torch.cat(emb_val, dim=0)
@@ -433,6 +456,13 @@ if __name__ == '__main__':
                             state_attention_mask=state_attention_mask,
                             return_mask_output=True,
                         ) 
+                else:
+                    log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(
+                        input_ids,
+                        state_input_ids=state_input_ids,
+                        state_attention_mask=state_attention_mask,
+                        return_mask_output=True,
+                    )
                 emb_test.append(masked_mapped_output.detach().cpu())
                 label_test.append(label.cpu())
             emb_test = torch.cat(emb_test, dim=0)

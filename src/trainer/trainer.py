@@ -5,6 +5,14 @@ import torch.distributed as dist
 from sklearn.metrics import f1_score, accuracy_score
 from tqdm import tqdm
 
+def check_model_parameters(model):
+    for name, param in model.named_parameters():
+        if param is not None and not torch.isfinite(param).all():
+            raise ValueError(f"Parameter {name} contains NaN or Inf.")
+    for name, buffer in model.named_buffers():
+        if buffer is not None and torch.is_floating_point(buffer) and not torch.isfinite(buffer).all():
+            raise ValueError(f"Buffer {name} contains NaN or Inf.")
+
 def unpack_batch(batch):
     if len(batch) >= 4:
         input_ids, label, state_input_ids, state_attention_mask = batch[:4]
@@ -16,7 +24,7 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
     losses, preds, labels = [], [], []
     sentiment_representations, sentiment_labels = [], []
     component_losses = {
-        "ce": [], "cl": [], "neutral": [], "supcon": [], "angle": [], "sas": [], "hard": []
+        "ce": [], "cl": [], "task": [], "neutral": [], "supcon": [], "angle": [], "sas": [], "hard": [], "gate_entropy": []
     }
 
     assert not train or optimizer != None
@@ -24,6 +32,8 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
         model.train()
     else:
         model.eval()
+    if hasattr(model, "current_epoch"):
+        model.current_epoch = epoch
     if args.disable_training_progress_bar:
         pbar = dataloader
     else:
@@ -50,6 +60,9 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
                 state_attention_mask=state_attention_mask,
             )
 
+        if not torch.isfinite(loss).all():
+            raise ValueError(f"Non-finite loss at epoch={epoch + 1}, batch={batch_id}: {loss.detach().cpu()}")
+
         if args.use_nearest_neighbour:
             pred = torch.argmax(anchor_scores[mask], dim=-1)
         else:
@@ -60,19 +73,25 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
         losses.append(loss.item())
         component_losses["ce"].append(loss_output.ce_loss.item())
         component_losses["cl"].append(loss_output.cl_loss.item())
+        component_losses["task"].append(loss_output.task_loss.item())
         component_losses["neutral"].append(loss_output.neutral_loss.item())
         component_losses["supcon"].append(loss_output.supcon_loss.item())
         component_losses["angle"].append(loss_output.angle_loss.item())
         component_losses["sas"].append(loss_output.sas_loss.item())
         component_losses["hard"].append(loss_output.hard_loss.item())
+        component_losses["gate_entropy"].append(loss_output.gate_entropy.item())
 
         if train:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2)
+            if not torch.isfinite(grad_norm):
+                raise ValueError(f"Non-finite gradient norm at epoch={epoch + 1}, batch={batch_id}: {grad_norm}")
             if batch_id % args.accumulation_step == 0:
                 optimizer.step()
                 if lr_scheduler is not None and getattr(args, "lr_scheduler", "step") != "step":
                     lr_scheduler.step()
+                if getattr(args, "debug_finite_checks", False):
+                    check_model_parameters(model)
                 optimizer.zero_grad()
         else:
             sentiment_representations.append(loss_output.sentiment_representations)
@@ -190,6 +209,8 @@ def retrain(model, loss_function, dataloader, epoch, device, args, optimizer=Non
             log_prob = model(data)
         
         loss = loss_function(log_prob, label)
+        if not torch.isfinite(loss).all():
+            raise ValueError(f"Non-finite stage-2 loss at epoch={epoch + 1}: {loss.detach().cpu()}")
         losses.append(loss.item())
         ce_losses.append(loss.item())
         pred = torch.argmax(log_prob, dim = -1)
@@ -197,7 +218,9 @@ def retrain(model, loss_function, dataloader, epoch, device, args, optimizer=Non
         labels.append(label)
         if train:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2)
+            if not torch.isfinite(grad_norm):
+                raise ValueError(f"Non-finite stage-2 gradient norm at epoch={epoch + 1}: {grad_norm}")
             optimizer.step()
             optimizer.zero_grad()
     if len(preds) != 0:

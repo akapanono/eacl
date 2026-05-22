@@ -50,6 +50,7 @@ class CLModel(nn.Module):
         self.state_gate = nn.Sequential(
             nn.Linear(self.dim * 2, self.dim),
             nn.ReLU(),
+            nn.Dropout(self.dropout),
             nn.Linear(self.dim, self.dim),
             nn.Sigmoid(),
         ).to(self.device)
@@ -73,6 +74,7 @@ class CLModel(nn.Module):
             nn.Linear(gate_input_dim, self.dim // 2),
             nn.LayerNorm(self.dim // 2),
             nn.ReLU(),
+            nn.Dropout(self.dropout),
             nn.Linear(self.dim // 2, args.num_subanchors),
         ).to(self.device)
 
@@ -104,6 +106,8 @@ class CLModel(nn.Module):
             torch.arange(active_classes, dtype=torch.long).repeat_interleave(self.num_subanchors).to(self.device)
         )
         self.last_forward_output = {}
+        self.last_gate_entropy = None
+        self.current_epoch = 0
 
     def device(self):
         return self.f_context_encoder.device
@@ -115,12 +119,14 @@ class CLModel(nn.Module):
         if scores.dim() != 3:
             return scores
         if self.args.prototype_pooling == "entropy":
-            domain_logits = scores.transpose(1, 2) / self.args.temp
+            domain_logits = (scores.transpose(1, 2) / self.args.temp).clamp(min=-50.0, max=50.0)
             domain_probs = F.softmax(domain_logits, dim=-1)
             entropy = -(domain_probs * torch.log(domain_probs + self.eps)).sum(dim=-1)
             domain_weights = 1.0 / (entropy + self.args.domain_entropy_eps)
             domain_weights = domain_weights / (domain_weights.sum(dim=-1, keepdim=True) + self.eps)
             fused_probs = (domain_weights.unsqueeze(-1) * domain_probs).sum(dim=1)
+            fused_probs = fused_probs.clamp(min=self.eps, max=1.0)
+            fused_probs = fused_probs / fused_probs.sum(dim=-1, keepdim=True).clamp_min(self.eps)
             self.last_domain_probs = domain_probs.detach()
             self.last_domain_weights = domain_weights.detach()
             self.last_domain_entropy = entropy.detach()
@@ -193,11 +199,15 @@ class CLModel(nn.Module):
             domain_features.unsqueeze(2),
             anchors.transpose(0, 1).unsqueeze(0)
         )
-        domain_logits = domain_scores / self.args.temp
+        domain_logits = (domain_scores / self.args.temp).clamp(min=-50.0, max=50.0)
         domain_probs = F.softmax(domain_logits, dim=-1)
         gate_input = self._domain_gate_input(mask_outputs, state_outputs, neutral_prob)
-        domain_weights = F.softmax(self.domain_gate(gate_input), dim=-1)
+        gate_logits = self.domain_gate(gate_input).clamp(min=-50.0, max=50.0)
+        domain_weights = F.softmax(gate_logits, dim=-1)
         fused_probs = (domain_weights.unsqueeze(-1) * domain_probs).sum(dim=1)
+        fused_probs = fused_probs.clamp(min=self.eps, max=1.0)
+        fused_probs = fused_probs / fused_probs.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        self.last_gate_entropy = -(domain_weights * torch.log(domain_weights + self.eps)).sum(dim=-1).mean()
         self.last_emo_anchor = anchors
         self.last_domain_probs = domain_probs.detach()
         self.last_domain_weights = domain_weights.detach()
@@ -205,6 +215,7 @@ class CLModel(nn.Module):
 
     def _expand_non_neutral_scores(self, non_neutral_logits, neutral_prob):
         p_emo = F.softmax(non_neutral_logits, dim=-1)
+        neutral_prob = neutral_prob.clamp(min=self.eps, max=1.0 - self.eps)
         final_probs = torch.zeros(
             non_neutral_logits.shape[0],
             self.num_classes,
@@ -213,11 +224,16 @@ class CLModel(nn.Module):
         )
         final_probs[:, self.neutral_id] = neutral_prob.squeeze(-1)
         final_probs[:, self.non_neutral_to_original] = (1.0 - neutral_prob) * p_emo
+        final_probs = final_probs.clamp(min=self.eps, max=1.0)
+        final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True).clamp_min(self.eps)
         return torch.log(final_probs + self.eps), final_probs, p_emo
 
     @torch.no_grad()
     def update_anchors(self, raw_outputs, labels):
         if self.args.disable_anchor_updates:
+            return
+        freeze_epochs = getattr(self.args, "freeze_prototype_epochs", 0)
+        if getattr(self, "current_epoch", 0) < freeze_epochs:
             return
         valid_mask = labels >= 0
         if valid_mask.sum().item() == 0:
@@ -250,9 +266,13 @@ class CLModel(nn.Module):
                 if member_mask.sum().item() == 0:
                     continue
                 centroid = class_raw[member_mask].mean(dim=0)
-                self.emo_anchor[class_id, subanchor_id].mul_(self.args.prototype_momentum).add_(
-                    centroid * (1.0 - self.args.prototype_momentum)
+                new_anchor = (
+                    self.emo_anchor[class_id, subanchor_id] * self.args.prototype_momentum
+                    + centroid * (1.0 - self.args.prototype_momentum)
                 )
+                if getattr(self.args, "normalize_prototypes_after_update", False):
+                    new_anchor = F.normalize(new_anchor, dim=-1)
+                self.emo_anchor[class_id, subanchor_id].copy_(new_anchor)
     
     def _forward(self, sentences, state_input_ids=None, state_attention_mask=None):
         mask = 1 - (sentences == (self.pad_value)).long()
