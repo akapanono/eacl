@@ -5,6 +5,13 @@ import pickle
 import pickle
 from utils.data_process import *
 
+DEFAULT_SPEAKER_STATE = {
+    "mental_state": "unknown.",
+    "interaction_relation": "unknown.",
+    "expression_style": "unknown.",
+    "context_shift": "unknown.",
+}
+
 class DialogueDataset(Dataset):    
     def __init__(self, args, dataset_name = 'IEMOCAP', split = 'train', speaker_vocab=None, label_vocab=None, tokenizer = None):
         self.speaker_vocab = speaker_vocab
@@ -18,6 +25,7 @@ class DialogueDataset(Dataset):
         self.wp = args.wp
         self.wf = args.wf
         self.max_len = args.max_len
+        self.state_max_len = getattr(args, "speaker_state_max_len", 64)
         self.pad_value = args.pad_value
         self.dataset_name = dataset_name
 
@@ -77,7 +85,8 @@ class DialogueDataset(Dataset):
                 
                 query_idx = idx
                 input_ids = full_context[:-len(utterance_ids[query_idx])]
-                ret_utterances.append((input_ids, turn_data['speaker'], turn_data['text']))# input_ids, speaker
+                speaker_state = turn_data.get("speaker_state", DEFAULT_SPEAKER_STATE)
+                ret_utterances.append((input_ids, turn_data['speaker'], turn_data['text'], speaker_state))# input_ids, speaker
                 ret_labels.append(dialogue[query_idx]['label'])
 
                 utterance_seq.append({
@@ -90,8 +99,19 @@ class DialogueDataset(Dataset):
         label_list = torch.LongTensor(ret_labels)
         return data_list, label_list, utterance_sequence
 
+    def format_speaker_state(self, speaker_state):
+        if not isinstance(speaker_state, dict):
+            speaker_state = DEFAULT_SPEAKER_STATE
+        values = {**DEFAULT_SPEAKER_STATE, **speaker_state}
+        return (
+            f"mental_state: {values['mental_state']} "
+            f"interaction_relation: {values['interaction_relation']} "
+            f"expression_style: {values['expression_style']} "
+            f"context_shift: {values['context_shift']}"
+        )
+
     def process(self, data):
-        input_ids, speaker, text = data
+        input_ids, speaker, text, _ = data
         # print(input_ids)
         p2 = 'For utterance: '+ text + " " + speaker + " feels <mask> "
         p2 = self.tokenizer(p2)['input_ids'][1:]
@@ -101,14 +121,26 @@ class DialogueDataset(Dataset):
         p2 = torch.LongTensor(p2)
         return p2
 
+    def process_speaker_state(self, data):
+        _, _, _, speaker_state = data
+        state_text = self.format_speaker_state(speaker_state)
+        state_ids = self.tokenizer(state_text)["input_ids"]
+        state_ids = pad_to_len(state_ids, self.state_max_len, self.pad_value)
+        state_ids = torch.LongTensor(state_ids)
+        state_mask = (state_ids != self.pad_value).long()
+        return state_ids, state_mask
+
     def save_path(self, dataset_name):
         return f'./data/{dataset_name}/processed/{self.split}'
 
     def __getitem__(self, index):
         text = self.data[index]
-        text = self.process(text)
+        raw_data = text
+        text = self.process(raw_data)
         label = self.labels[index]
-       
+        if getattr(self.args, "use_speaker_state", False):
+            state_ids, state_mask = self.process_speaker_state(raw_data)
+            return text, label, state_ids, state_mask
         return text, label
 
     def __len__(self):

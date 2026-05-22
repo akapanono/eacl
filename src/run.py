@@ -3,7 +3,7 @@ import numpy as np, argparse, time, pickle, random
 import torch
 import torch.nn as nn
 import math
-from trainer.trainer import  train_or_eval_model, retrain
+from trainer.trainer import  train_or_eval_model, retrain, unpack_batch
 from dataset import DialogueDataset
 from torch.utils.data import DataLoader, sampler, TensorDataset
 from transformers import AutoTokenizer
@@ -116,6 +116,11 @@ def get_parser():
     parser.add_argument('--wf', type=int, default=0, help='future window size')
     parser.add_argument("--ce_loss_weight", type=float, default=0.1)
     parser.add_argument("--angle_loss_weight", type=float, default=1.0)
+    parser.add_argument("--lambda_neu", type=float, default=0.5)
+    parser.add_argument("--lambda_supcon", type=float, default=1.0)
+    parser.add_argument("--lambda_angle", type=float, default=0.05)
+    parser.add_argument("--lambda_sas", type=float, default=0.02)
+    parser.add_argument("--lambda_hard", type=float, default=0.05)
     parser.add_argument('--max_len', type=int, default=256,
                         help='max content length for each text, if set to 0, then the max length has no constrain')
     parser.add_argument("--temp", type=float, default=0.5)
@@ -148,6 +153,16 @@ def get_parser():
                         help="Warmup ratio used by the cosine scheduler.")
     parser.add_argument("--class_balanced_ce", action="store_true",
                         help="Use inverse-frequency class weights in cross entropy.")
+    parser.add_argument("--use_neutral_decoupling", action="store_true",
+                        help="Use a separate neutral-vs-non-neutral branch before prototype matching.")
+    parser.add_argument("--use_speaker_state", action="store_true",
+                        help="Encode optional speaker_state text and fuse it into domain reasoning.")
+    parser.add_argument("--speaker_state_max_len", type=int, default=64)
+    parser.add_argument("--speaker_state_pooling", type=str, default="mean", choices=["mean", "cls"])
+    parser.add_argument("--use_state_fusion", action="store_true", default=True)
+    parser.add_argument("--disable_state_fusion", action="store_true")
+    parser.add_argument("--use_state_in_domain_gate", action="store_true", default=True)
+    parser.add_argument("--disable_state_in_domain_gate", action="store_true")
     ### Environment params
     parser.add_argument("--fp16", type=bool, default=True)
     parser.add_argument("--seed", type=int, default=2)
@@ -168,6 +183,12 @@ def get_parser():
     parser.add_argument("--prototype_pooling", type=str, default="max", choices=["max", "logsumexp", "entropy", "domain_gated"])
     parser.add_argument("--domain_entropy_eps", type=float, default=1e-6)
     parser.add_argument("--disable_anchor_updates", action="store_true")
+    parser.add_argument("--use_similar_anchor_separation", action="store_true")
+    parser.add_argument("--use_hard_anchor_negative", action="store_true")
+    parser.add_argument("--similar_emotion_pairs", type=str, default="happy:excited,sad:frustrated,angry:frustrated")
+    parser.add_argument("--sas_margin", type=float, default=0.30)
+    parser.add_argument("--hard_negative_rho", type=float, default=2.0)
+    parser.add_argument("--hard_negative_temperature", type=float, default=0.07)
     parser.add_argument("--early_stop_patience", type=int, default=0,
                         help="Stop stage 1 if the selected metric does not improve for N epochs. 0 disables early stopping.")
     parser.add_argument("--early_stop_metric", type=str, default="test", choices=["valid", "test"],
@@ -182,13 +203,23 @@ def get_parser():
     parser.add_argument("--save_path", default='./saved_models/', type=str)
 
     args = parser.parse_args()
+    if args.disable_state_fusion:
+        args.use_state_fusion = False
+    if args.disable_state_in_domain_gate:
+        args.use_state_in_domain_gate = False
     return args
 
 if __name__ == '__main__':
     args = get_parser()
     if args.prototype_pooling in ["entropy", "domain_gated"] and args.num_subanchors != 4:
         raise ValueError(f"--prototype_pooling {args.prototype_pooling} expects --num_subanchors 4 so each subanchor index maps to one domain.")
-    if args.prototype_pooling in ["entropy", "domain_gated"] and not args.force_two_stage:
+    uses_sas_nsg = any([
+        args.use_neutral_decoupling,
+        args.use_speaker_state,
+        args.use_similar_anchor_separation,
+        args.use_hard_anchor_negative,
+    ])
+    if (args.prototype_pooling in ["entropy", "domain_gated"] or uses_sas_nsg) and not args.force_two_stage:
         args.disable_two_stage_training = True
     if args.fp16:
         torch.set_float32_matmul_precision('medium')
@@ -267,19 +298,20 @@ if __name__ == '__main__':
     for e in range(n_epochs):
         start_time = time.time()
         
-        train_loss, train_acc, _, _, train_fscore, train_detail_f1, max_cosine  = \
+        train_loss, train_acc, _, _, train_fscore, train_detail_f1, max_cosine, train_stats  = \
             train_or_eval_model(model, loss_function, train_loader, e, device, args, optimizer, lr_scheduler, True)
         if args.lr_scheduler == "step":
             lr_scheduler.step()
-        valid_loss, valid_acc, _, _, valid_fscore, valid_detail_f1, _ = \
+        valid_loss, valid_acc, _, _, valid_fscore, valid_detail_f1, _, valid_stats = \
             train_or_eval_model(model, loss_function, valid_loader, e, device, args)
-        test_loss, test_acc, test_label, test_pred, test_fscore, test_detail_f1, _ = \
+        test_loss, test_acc, test_label, test_pred, test_fscore, test_detail_f1, _, test_stats = \
             train_or_eval_model(model, loss_function, test_loader, e, device, args)
         all_fscore.append([valid_fscore, test_fscore, test_detail_f1])
 
         logger.info( 'Epoch: {}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'. \
             format(e + 1, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc,
             test_fscore, round(time.time() - start_time, 2)))
+        logger.info('Loss/detail stats: train={}, valid={}, test={}'.format(train_stats, valid_stats, test_stats))
 
         if valid_fscore > best_valid_fscore:
             best_valid_fscore = valid_fscore
@@ -340,40 +372,67 @@ if __name__ == '__main__':
             emb_train, emb_val, emb_test = [] ,[] ,[]
             label_train, label_val, label_test = [], [], []
             for batch_id, batch in enumerate(train_loader):
-                input_ids, label = batch
+                input_ids, label, state_input_ids, state_attention_mask = unpack_batch(batch)
                 input_orig = input_ids
                 input_aug = None
                 input_ids = input_orig.to(device)
                 label = label.to(device)
+                if state_input_ids is not None:
+                    state_input_ids = state_input_ids.to(device)
+                if state_attention_mask is not None:
+                    state_attention_mask = state_attention_mask.to(device)
                 if args.fp16:
                     with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(input_ids, return_mask_output=True) 
+                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(
+                            input_ids,
+                            state_input_ids=state_input_ids,
+                            state_attention_mask=state_attention_mask,
+                            return_mask_output=True,
+                        ) 
                 emb_train.append(masked_mapped_output.detach().cpu())
                 label_train.append(label.cpu())
             emb_train = torch.cat(emb_train, dim=0)
             label_train = torch.cat(label_train, dim=0)
             for batch_id, batch in enumerate(valid_loader):
-                input_ids, label = batch
+                input_ids, label, state_input_ids, state_attention_mask = unpack_batch(batch)
                 input_orig = input_ids
                 input_aug = None
                 input_ids = input_orig.to(device)
                 label = label.to(device)
+                if state_input_ids is not None:
+                    state_input_ids = state_input_ids.to(device)
+                if state_attention_mask is not None:
+                    state_attention_mask = state_attention_mask.to(device)
                 if args.fp16:
                     with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(input_ids, return_mask_output=True) 
+                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(
+                            input_ids,
+                            state_input_ids=state_input_ids,
+                            state_attention_mask=state_attention_mask,
+                            return_mask_output=True,
+                        ) 
                 emb_val.append(masked_mapped_output.detach().cpu())
                 label_val.append(label.cpu())
             emb_val = torch.cat(emb_val, dim=0)
             label_val = torch.cat(label_val, dim=0)
             for batch_id, batch in enumerate(test_loader):
-                input_ids, label = batch
+                input_ids, label, state_input_ids, state_attention_mask = unpack_batch(batch)
                 input_orig = input_ids
                 input_aug = None
                 input_ids = input_orig.to(device)
                 label = label.to(device)
+                if state_input_ids is not None:
+                    state_input_ids = state_input_ids.to(device)
+                if state_attention_mask is not None:
+                    state_attention_mask = state_attention_mask.to(device)
                 if args.fp16:
                     with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(input_ids, return_mask_output=True) 
+                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(
+                            input_ids,
+                            state_input_ids=state_input_ids,
+                            state_attention_mask=state_attention_mask,
+                            return_mask_output=True,
+                        ) 
                 emb_test.append(masked_mapped_output.detach().cpu())
                 label_test.append(label.cpu())
             emb_test = torch.cat(emb_test, dim=0)
