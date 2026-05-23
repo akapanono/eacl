@@ -56,12 +56,46 @@ BASE_CONFIG = {
     "fusion_alpha": 0.5,
     "use_neutral_aware_supcon": False,
     "prototype_update_policy": "momentum",
+    "disable_prototype_update": False,
     "accumulation_step": 1,
+}
+
+RESCUE_BASE_CONFIG = {
+    **BASE_CONFIG,
+    "lr": 3e-5,
+    "ptmlr": 3e-6,
+    "dropout": 0.3,
+    "batch_size": 8,
+    "accumulation_step": 2,
+    "max_grad_norm": 0.5,
+    "ce_loss_weight": 0.4,
+    "lambda_neu": 0.2,
+    "lambda_supcon": 0.1,
+    "lambda_angle": 0.0,
+    "lambda_sas": 0.0,
+    "lambda_hard": 0.0,
+    "lambda_gate_entropy": 0.0,
+    "use_speaker_state": False,
+    "use_speaker_memory": False,
+    "use_similar_anchor_separation": False,
+    "use_hard_anchor_negative": False,
+    "use_classifier_prototype_fusion": True,
+    "fusion_type": "fixed",
+    "fusion_alpha": 0.5,
+    "use_neutral_aware_supcon": False,
+    "hard_negative_schedule": "constant",
+    "prototype_update_policy": "momentum",
 }
 
 
 def make_config(name, group, **overrides):
     cfg = {"name": name, "group": group, **BASE_CONFIG}
+    cfg.update(overrides)
+    return cfg
+
+
+def make_rescue_config(name, **overrides):
+    cfg = {"name": name, "group": "rescue", **RESCUE_BASE_CONFIG}
     cfg.update(overrides)
     return cfg
 
@@ -108,6 +142,72 @@ def candidate_configs():
             hard_negative_schedule="curriculum",
             prototype_update_policy="validation_guarded",
         ),
+        make_rescue_config(
+            "Z0_historical_baseline",
+            prototype_pooling="domain_gated",
+            use_speaker_state=True,
+            use_similar_anchor_separation=True,
+            use_hard_anchor_negative=True,
+            lambda_supcon=0.2,
+            lambda_angle=0.01,
+            lambda_sas=0.002,
+            lambda_hard=0.005,
+            lambda_gate_entropy=0.001,
+            use_classifier_prototype_fusion=False,
+            fusion_alpha=0.5,
+            lr=5e-5,
+            ptmlr=5e-6,
+            dropout=0.25,
+            accumulation_step=1,
+            freeze_prototype_epochs=3,
+        ),
+        make_rescue_config(
+            "Z1_no_hard",
+            prototype_pooling="domain_gated",
+            use_speaker_state=True,
+            use_similar_anchor_separation=True,
+            lambda_sas=0.002,
+            lambda_supcon=0.2,
+            lambda_angle=0.01,
+            lambda_gate_entropy=0.001,
+            lr=5e-5,
+            ptmlr=5e-6,
+            dropout=0.25,
+            accumulation_step=1,
+            freeze_prototype_epochs=3,
+        ),
+        make_rescue_config(
+            "Z2_no_hard_no_sas",
+            prototype_pooling="domain_gated",
+            use_speaker_state=True,
+            lambda_supcon=0.2,
+            lambda_angle=0.01,
+            lambda_gate_entropy=0.001,
+            lr=5e-5,
+            ptmlr=5e-6,
+            dropout=0.25,
+            accumulation_step=1,
+            freeze_prototype_epochs=3,
+        ),
+        make_rescue_config(
+            "Z3_logsumexp_no_aux",
+            prototype_pooling="logsumexp",
+            fusion_alpha=0.5,
+        ),
+        make_rescue_config(
+            "Z4_logsumexp_fixed_anchor",
+            prototype_pooling="logsumexp",
+            fusion_alpha=0.5,
+            freeze_prototype_epochs=999,
+            disable_prototype_update=True,
+        ),
+        make_rescue_config(
+            "Z5_classifier_dominant_rescue",
+            prototype_pooling="logsumexp",
+            fusion_alpha=0.7,
+            freeze_prototype_epochs=999,
+            disable_prototype_update=True,
+        ),
     ]
     return [{"trial": idx, "seed": 4668, **cfg} for idx, cfg in enumerate(configs, start=1)]
 
@@ -138,6 +238,8 @@ def filter_configs(configs, experiment_set):
         return [cfg for cfg in configs if cfg["group"] in ["baseline", "fusion"]]
     if experiment_set == "smf":
         return [cfg for cfg in configs if cfg["group"] in ["baseline", "smf"]]
+    if experiment_set == "rescue":
+        return [cfg for cfg in configs if cfg["group"] == "rescue"]
     return configs
 
 
@@ -205,6 +307,8 @@ def build_command(args, cfg, save_path):
         cmd.append("--class_balanced_ce")
     if cfg["disable_anchor_updates"] or args.disable_anchor_updates:
         cmd.append("--disable_anchor_updates")
+    if cfg["disable_prototype_update"]:
+        cmd.append("--disable_prototype_update")
     if cfg["use_classifier_prototype_fusion"]:
         cmd.extend(["--use_classifier_prototype_fusion", "--fusion_alpha", fmt_float(cfg["fusion_alpha"])])
     if cfg["use_neutral_aware_supcon"]:
@@ -255,7 +359,7 @@ def write_tables(rows, summary_path, leaderboard_path):
         "use_similar_anchor_separation", "use_hard_anchor_negative", "class_balanced_ce",
         "hard_negative_schedule", "disable_anchor_updates", "use_classifier_prototype_fusion",
         "fusion_type", "fusion_alpha", "use_neutral_aware_supcon", "prototype_update_policy",
-        "accumulation_step", "confusion_matrix", "similar_pair_confusion",
+        "disable_prototype_update", "accumulation_step", "confusion_matrix", "similar_pair_confusion",
         "duration_sec", "returncode", "run_dir", "stdout_log", "logging_log", "command",
     ]
     for path, data in [
@@ -283,7 +387,7 @@ def main():
     parser.add_argument("--anchor-path", type=Path, default=Path("emo_anchors/sup-simcse-roberta-large"))
     parser.add_argument("--num-subanchors", type=int, default=4)
     parser.add_argument("--prototype-pooling", default="domain_gated", choices=["domain_gated", "max", "logsumexp", "entropy"])
-    parser.add_argument("--experiment-set", default="all", choices=["all", "ablation", "targeted", "fusion", "smf"],
+    parser.add_argument("--experiment-set", default="all", choices=["all", "ablation", "targeted", "fusion", "smf", "rescue"],
                         help="Which predefined next-round experiments to run.")
     parser.add_argument("--early-stop-patience", type=int, default=5)
     parser.add_argument("--similar-emotion-pairs", default="happy:excited,sad:frustrated,angry:frustrated")

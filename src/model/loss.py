@@ -100,11 +100,14 @@ def loss_function(log_prob, reps, raw_reps, label, mask, model):
     ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-1, weight=class_weights).to(reps.device)
     scl_loss_fn = SupConLoss(model.args)
     cl_loss = scl_loss_fn(reps, label, model, return_representations=not model.training)
+    angle_weight = getattr(model.args, "lambda_angle", getattr(model.args, "angle_loss_weight", 1.0))
+    if angle_weight <= 0:
+        cl_loss.angle_loss = zero_like_reps(reps)
     neutral_loss = zero_like_reps(reps)
     sas_loss = zero_like_reps(reps)
     hard_loss = zero_like_reps(reps)
     gate_entropy = getattr(model, "last_gate_entropy", None)
-    if gate_entropy is None:
+    if gate_entropy is None or getattr(model.args, "lambda_gate_entropy", 0.0) <= 0:
         gate_entropy = zero_like_reps(reps)
     if getattr(model, "use_neutral_decoupling", False):
         ce_loss, neutral_loss = neutral_decoupling_loss_stable(label, mask, model)
@@ -113,14 +116,14 @@ def loss_function(log_prob, reps, raw_reps, label, mask, model):
             ce_loss = zero_like_reps(reps)
         else:
             ce_loss = ce_loss_fn(log_prob[mask], label[mask])
-    if getattr(model.args, "use_similar_anchor_separation", False):
+    if getattr(model.args, "use_similar_anchor_separation", False) and getattr(model.args, "lambda_sas", 0.0) > 0:
         anchor_embeddings = model.get_domain_mapped_anchors() if model.args.prototype_pooling == "domain_gated" else model.get_mapped_anchors()
         sas_loss = similar_anchor_separation_loss(
             anchor_embeddings,
             get_similar_pair_ids(model),
             margin=getattr(model.args, "sas_margin", 0.30),
         )
-    if getattr(model.args, "use_hard_anchor_negative", False):
+    if getattr(model.args, "use_hard_anchor_negative", False) and getattr(model.args, "lambda_hard", 0.0) > 0:
         hard_rho = get_current_hard_negative_rho(model)
         hard_loss = hard_anchor_negative_loss(
             reps,
@@ -143,12 +146,12 @@ def loss_function(log_prob, reps, raw_reps, label, mask, model):
         total_loss = (
             task_loss
             + getattr(model.args, "lambda_supcon", 1.0) * cl_loss.supcon_loss
-            + getattr(model.args, "lambda_angle", getattr(model.args, "angle_loss_weight", 1.0)) * cl_loss.angle_loss
+            + angle_weight * cl_loss.angle_loss
             + getattr(model.args, "lambda_sas", 0.02) * sas_loss
             + getattr(model.args, "lambda_hard", 0.05) * hard_loss
             - getattr(model.args, "lambda_gate_entropy", 0.0) * gate_entropy
         )
-        combined_cl = cl_loss.supcon_loss + getattr(model.args, "lambda_angle", getattr(model.args, "angle_loss_weight", 1.0)) * cl_loss.angle_loss
+        combined_cl = cl_loss.supcon_loss + angle_weight * cl_loss.angle_loss
     else:
         combined_cl = cl_loss.loss
         task_loss = ce_loss

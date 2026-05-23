@@ -2,6 +2,7 @@ import os
 import numpy as np, argparse, time, pickle, random
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from trainer.trainer import  train_or_eval_model, retrain, unpack_batch
 from dataset import DialogueDataset
@@ -193,6 +194,8 @@ def get_parser():
     parser.add_argument("--prototype_pooling", type=str, default="max", choices=["max", "logsumexp", "entropy", "domain_gated"])
     parser.add_argument("--domain_entropy_eps", type=float, default=1e-6)
     parser.add_argument("--disable_anchor_updates", action="store_true")
+    parser.add_argument("--disable_prototype_update", action="store_true",
+                        help="Alias for --disable_anchor_updates. Stops momentum prototype updates.")
     parser.add_argument("--freeze_prototype_epochs", type=int, default=2)
     parser.add_argument("--normalize_prototypes_after_update", action="store_true", default=True)
     parser.add_argument("--disable_prototype_normalization", action="store_true")
@@ -243,6 +246,8 @@ def get_parser():
         args.use_state_in_domain_gate = False
     if args.disable_prototype_normalization:
         args.normalize_prototypes_after_update = False
+    if args.disable_prototype_update:
+        args.disable_anchor_updates = True
     return args
 
 def parse_similar_pairs_text(pairs):
@@ -368,6 +373,7 @@ if __name__ == '__main__':
         model.f_context_encoder.gradient_checkpointing_enable()
     device = f"cuda:{args.gpu_id}" if args.cuda else "cpu"
     model = model.to(device)
+    init_anchor = model.emo_anchor.detach().clone()
     if args.class_balanced_ce:
         model.ce_class_weights = compute_class_weights(trainset.labels, n_classes, device)
         logger.info("class-balanced CE weights: {}".format(model.ce_class_weights.detach().cpu().tolist()))
@@ -411,6 +417,13 @@ if __name__ == '__main__':
         logger.info( 'Epoch: {}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'. \
             format(e + 1, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc,
             test_fscore, round(time.time() - start_time, 2)))
+        current_anchor = model.emo_anchor.detach()
+        prototype_drift = (
+            1.0 - F.cosine_similarity(init_anchor.flatten(1), current_anchor.flatten(1), dim=-1)
+        ).mean().item()
+        train_stats["prototype_drift"] = round(float(prototype_drift), 6)
+        valid_stats["prototype_drift"] = round(float(prototype_drift), 6)
+        test_stats["prototype_drift"] = round(float(prototype_drift), 6)
         logger.info('Loss/detail stats: train={}, valid={}, test={}'.format(train_stats, valid_stats, test_stats))
 
         if args.prototype_update_policy == "validation_guarded" and hasattr(model, "prototype_updates_stopped"):

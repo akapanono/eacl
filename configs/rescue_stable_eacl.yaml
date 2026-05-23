@@ -1,0 +1,51 @@
+model: Stable-EACL-Rescue
+
+dataset_name: IEMOCAP
+epochs: 30
+seed: 4668
+
+backbone:
+  bert_path: pretrained/sup-simcse-roberta-large
+  anchor_path: emo_anchors/sup-simcse-roberta-large
+
+training:
+  lr: 3e-5
+  ptmlr: 3e-6
+  dropout: 0.3
+  batch_size: 8
+  accumulation_step: 2
+  effective_batch_size: 16
+  temp: 0.3
+  lr_scheduler: cosine
+  warmup_ratio: 0.08
+  max_grad_norm: 0.5
+  early_stop_patience: 5
+  early_stop_metric: valid
+  save_best_metric: valid
+  class_balanced_ce: true
+
+model_switches:
+  use_neutral_decoupling: true
+  use_classifier_prototype_fusion: true
+  fusion_type: fixed
+  fusion_alpha: 0.7
+  use_speaker_state: false
+  use_speaker_memory: false
+  use_similar_anchor_separation: false
+  use_hard_anchor_negative: false
+  use_neutral_aware_supcon: false
+
+anchors:
+  num_subanchors: 4
+  prototype_pooling: logsumexp
+  freeze_prototype_epochs: 999
+  disable_prototype_update: true
+  normalize_prototypes_after_update: true
+
+loss:
+  lambda_neu: 0.2
+  lambda_supcon: 0.1
+  lambda_angle: 0.0
+  lambda_sas: 0.0
+  lambda_hard: 0.0
+  lambda_gate_entropy: 0.0
