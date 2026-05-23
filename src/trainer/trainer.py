@@ -14,15 +14,19 @@ def check_model_parameters(model):
             raise ValueError(f"Buffer {name} contains NaN or Inf.")
 
 def unpack_batch(batch):
+    if len(batch) >= 6:
+        input_ids, label, state_input_ids, state_attention_mask, memory_input_ids, memory_attention_mask = batch[:6]
+        return input_ids, label, state_input_ids, state_attention_mask, memory_input_ids, memory_attention_mask
     if len(batch) >= 4:
         input_ids, label, state_input_ids, state_attention_mask = batch[:4]
-        return input_ids, label, state_input_ids, state_attention_mask
+        return input_ids, label, state_input_ids, state_attention_mask, None, None
     input_ids, label = batch
-    return input_ids, label, None, None
+    return input_ids, label, None, None, None, None
 
 def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, optimizer=None, lr_scheduler=None, train=False):
     losses, preds, labels = [], [], []
     sentiment_representations, sentiment_labels = [], []
+    fusion_alphas = []
     component_losses = {
         "ce": [], "cl": [], "task": [], "neutral": [], "supcon": [], "angle": [], "sas": [], "hard": [], "gate_entropy": []
     }
@@ -41,7 +45,7 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
     
     for batch_id, batch in enumerate(pbar):
         
-        input_ids, label, state_input_ids, state_attention_mask = unpack_batch(batch)
+        input_ids, label, state_input_ids, state_attention_mask, memory_input_ids, memory_attention_mask = unpack_batch(batch)
        
         input_orig = input_ids
         input_aug = None
@@ -52,12 +56,16 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
                     model, loss_function, input_orig, input_aug, label, device,
                     state_input_ids=state_input_ids,
                     state_attention_mask=state_attention_mask,
+                    memory_input_ids=memory_input_ids,
+                    memory_attention_mask=memory_attention_mask,
                 )
         else:
             loss, loss_output, log_prob, label, mask, anchor_scores = _forward(
                 model, loss_function, input_orig, input_aug, label, device,
                 state_input_ids=state_input_ids,
                 state_attention_mask=state_attention_mask,
+                memory_input_ids=memory_input_ids,
+                memory_attention_mask=memory_attention_mask,
             )
 
         if not torch.isfinite(loss).all():
@@ -70,6 +78,8 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
 
         preds.append(pred)
         labels.append(label)
+        if hasattr(model, "last_fusion_alpha") and model.last_fusion_alpha is not None:
+            fusion_alphas.append(model.last_fusion_alpha[mask].detach().cpu())
         losses.append(loss.item())
         component_losses["ce"].append(loss_output.ce_loss.item())
         component_losses["cl"].append(loss_output.cl_loss.item())
@@ -162,11 +172,40 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
         stats["avg_domain_weight"] = [
             round(item, 4) for item in model.last_domain_weights.float().mean(dim=0).detach().cpu().tolist()
         ]
+    if hasattr(model, "last_fusion_alpha") and model.last_fusion_alpha is not None:
+        stats["avg_fusion_alpha"] = round(float(model.last_fusion_alpha.float().mean().detach().cpu().item()), 4)
+    if fusion_alphas:
+        alpha_values = torch.cat(fusion_alphas).float().numpy()
+        usable = min(len(alpha_values), len(new_labels))
+        if usable > 0:
+            alpha_values = alpha_values[:usable]
+            stats["avg_alpha"] = round(float(np.mean(alpha_values)), 4)
+            correct_mask = new_labels[:usable] == new_preds[:usable]
+            if correct_mask.any():
+                stats["alpha_correct"] = round(float(np.mean(alpha_values[correct_mask])), 4)
+            if (~correct_mask).any():
+                stats["alpha_wrong"] = round(float(np.mean(alpha_values[~correct_mask])), 4)
+            stats["alpha_by_class"] = [
+                round(float(np.mean(alpha_values[new_labels[:usable] == class_id])), 4)
+                if (new_labels[:usable] == class_id).any() else None
+                for class_id in range(n)
+            ]
 
     return avg_loss, avg_accuracy, labels, preds, avg_fscore, f1_scores, max_cosine, stats
 
 
-def _forward(model, loss_function, input_orig, input_aug, label, device, state_input_ids=None, state_attention_mask=None):
+def _forward(
+    model,
+    loss_function,
+    input_orig,
+    input_aug,
+    label,
+    device,
+    state_input_ids=None,
+    state_attention_mask=None,
+    memory_input_ids=None,
+    memory_attention_mask=None,
+):
 
     input_ids = input_orig.to(device)
     label = label.to(device)
@@ -174,6 +213,10 @@ def _forward(model, loss_function, input_orig, input_aug, label, device, state_i
         state_input_ids = state_input_ids.to(device)
     if state_attention_mask is not None:
         state_attention_mask = state_attention_mask.to(device)
+    if memory_input_ids is not None:
+        memory_input_ids = memory_input_ids.to(device)
+    if memory_attention_mask is not None:
+        memory_attention_mask = memory_attention_mask.to(device)
     mask = torch.ones(len(input_orig)).to(device)
     mask = mask > 0.5
     if model.training:
@@ -181,6 +224,8 @@ def _forward(model, loss_function, input_orig, input_aug, label, device, state_i
             input_ids,
             state_input_ids=state_input_ids,
             state_attention_mask=state_attention_mask,
+            memory_input_ids=memory_input_ids,
+            memory_attention_mask=memory_attention_mask,
             return_mask_output=True,
         ) 
         loss_output = loss_function(log_prob, masked_mapped_output, masked_output, label, mask, model)
@@ -190,6 +235,8 @@ def _forward(model, loss_function, input_orig, input_aug, label, device, state_i
                 input_ids,
                 state_input_ids=state_input_ids,
                 state_attention_mask=state_attention_mask,
+                memory_input_ids=memory_input_ids,
+                memory_attention_mask=memory_attention_mask,
                 return_mask_output=True,
             ) 
             loss_output = loss_function(log_prob, masked_mapped_output, masked_output, label, mask, model)

@@ -121,19 +121,23 @@ def loss_function(log_prob, reps, raw_reps, label, mask, model):
             margin=getattr(model.args, "sas_margin", 0.30),
         )
     if getattr(model.args, "use_hard_anchor_negative", False):
+        hard_rho = get_current_hard_negative_rho(model)
         hard_loss = hard_anchor_negative_loss(
             reps,
             label,
             model,
             get_similar_pair_ids(model),
             temperature=getattr(model.args, "hard_negative_temperature", 0.07),
-            rho=getattr(model.args, "hard_negative_rho", 2.0),
+            rho=hard_rho,
         )
     if any([
         getattr(model.args, "use_neutral_decoupling", False),
         getattr(model.args, "use_speaker_state", False),
+        getattr(model.args, "use_speaker_memory", False),
         getattr(model.args, "use_similar_anchor_separation", False),
         getattr(model.args, "use_hard_anchor_negative", False),
+        getattr(model.args, "use_classifier_prototype_fusion", False),
+        getattr(model.args, "use_neutral_aware_supcon", False),
     ]):
         task_loss = ce_loss + getattr(model.args, "lambda_neu", 0.5) * neutral_loss
         total_loss = (
@@ -215,8 +219,44 @@ class SupConLoss(nn.Module):
 
     def score_func(self, x, y):
         return (1 + F.cosine_similarity(x, y, dim=-1))/2 + self.eps
+
+    def pairwise_supcon(self, reps, labels):
+        if reps.shape[0] <= 1:
+            return reps.new_tensor(0.0)
+        labels = labels.long()
+        valid_mask = labels >= 0
+        reps = reps[valid_mask]
+        labels = labels[valid_mask]
+        if reps.shape[0] <= 1:
+            return reps.new_tensor(0.0)
+        bsz = reps.shape[0]
+        mask = 1 - torch.eye(bsz, device=reps.device)
+        pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)).long()
+        rep1 = reps.unsqueeze(0).expand(bsz, bsz, reps.shape[-1])
+        rep2 = reps.unsqueeze(1).expand(bsz, bsz, reps.shape[-1])
+        scores = self.score_func(rep1, rep2)
+        scores = scores * mask
+        scores = scores / max(float(self.temperature), self.eps)
+        scores = scores - torch.max(scores).detach()
+        scores = torch.exp(scores)
+        pos_scores = scores * (pos_mask * mask)
+        neg_scores = scores * (1 - pos_mask)
+        positive_count = (pos_mask * mask).sum(-1)
+        valid_rows = positive_count > 0
+        if valid_rows.sum().item() == 0:
+            return reps.new_tensor(0.0)
+        probs = pos_scores.sum(-1) / (pos_scores.sum(-1) + neg_scores.sum(-1) + self.eps)
+        probs = probs / positive_count.clamp_min(1).float()
+        row_loss = -torch.log(probs.clamp_min(self.eps))
+        row_loss = row_loss[valid_rows]
+        finite_mask = torch.isfinite(row_loss) & (row_loss > 0.0)
+        if finite_mask.sum().item() == 0:
+            return reps.new_tensor(0.0)
+        return row_loss[finite_mask].mean()
     
     def forward(self, reps, labels, model, return_representations=False):
+        original_reps = reps
+        original_labels = labels
         if getattr(model, "use_neutral_decoupling", False):
             valid_sample_mask = (labels >= 0) & (labels != model.neutral_id)
             reps = reps[valid_sample_mask]
@@ -238,6 +278,34 @@ class SupConLoss(nn.Module):
             sentiment_labels = None
             sentiment_representations = None
             sentiment_anchortypes = None
+        if getattr(self.args, "use_neutral_aware_supcon", False) and getattr(model, "neutral_id", None) is not None:
+            valid_original_mask = original_labels >= 0
+            valid_original_reps = original_reps[valid_original_mask]
+            valid_original_labels = original_labels[valid_original_mask]
+            if valid_original_reps.shape[0] == 0:
+                neutral_cl = original_reps.new_tensor(0.0)
+            else:
+                binary_labels = (valid_original_labels != model.neutral_id).long()
+                neutral_cl = self.pairwise_supcon(valid_original_reps, binary_labels)
+            emo_cl = self.pairwise_supcon(
+                torch.cat([reps, flat_anchor], dim=0) if not self.args.disable_emo_anchor else reps,
+                torch.cat([labels, anchor_labels], dim=0) if not self.args.disable_emo_anchor else labels,
+            )
+            supcon_loss = (
+                getattr(self.args, "lambda_neu_cl", 0.1) * neutral_cl
+                + getattr(self.args, "lambda_emo_cl", 0.2) * emo_cl
+            )
+            loss = supcon_loss + self.args.angle_loss_weight * angleloss
+            return SupConOutput(
+                loss=loss,
+                supcon_loss=supcon_loss,
+                angle_loss=angleloss,
+                sentiment_representations=sentiment_representations,
+                sentiment_labels=sentiment_labels,
+                sentiment_anchortypes=sentiment_anchortypes,
+                anchortype_labels=anchor_labels,
+                max_cosine=max_cosine,
+            )
         if batch_size == 0:
             loss = reps.new_tensor(0.0)
             return SupConOutput(
@@ -337,6 +405,8 @@ def similar_anchor_separation_loss(anchor_embeddings, similar_pair_ids, margin=0
 def hard_anchor_negative_loss(sample_repr, labels, model, similar_pair_ids, temperature=0.07, rho=2.0):
     if not similar_pair_ids:
         return sample_repr.new_tensor(0.0)
+    if float(rho) <= 0.0:
+        return sample_repr.new_tensor(0.0)
     valid_mask = labels >= 0
     if getattr(model, "use_neutral_decoupling", False):
         valid_mask = valid_mask & (labels != model.neutral_id)
@@ -377,3 +447,14 @@ def hard_anchor_negative_loss(sample_repr, labels, model, similar_pair_ids, temp
     loss = (log_den - log_pos).mean()
     check_finite_loss({"hard_loss": loss})
     return loss
+
+def get_current_hard_negative_rho(model):
+    args = model.args
+    if getattr(args, "hard_negative_schedule", "constant") != "curriculum":
+        return getattr(args, "hard_negative_rho", 2.0)
+    epoch = getattr(model, "current_epoch", 0) + 1
+    if epoch <= getattr(args, "hard_warmup_epochs", 3):
+        return getattr(args, "hard_rho_warmup", 0.0)
+    if epoch <= getattr(args, "hard_mild_epochs", 8):
+        return getattr(args, "hard_rho_mild", 0.2)
+    return getattr(args, "hard_rho_full", 0.5)

@@ -31,6 +31,7 @@ class CLModel(nn.Module):
         )
         self.use_neutral_decoupling = _flag(args, "use_neutral_decoupling")
         self.use_speaker_state = _flag(args, "use_speaker_state")
+        self.use_speaker_memory = _flag(args, "use_speaker_memory")
         self.use_state_fusion = _flag(args, "use_state_fusion", True)
         self.use_state_in_domain_gate = _flag(args, "use_state_in_domain_gate", True)
         self.map_function = nn.Sequential(
@@ -55,6 +56,16 @@ class CLModel(nn.Module):
             nn.Sigmoid(),
         ).to(self.device)
         self.state_fusion_norm = nn.LayerNorm(self.dim).to(self.device)
+        self.memory_proj = nn.Linear(self.dim, self.dim).to(self.device)
+        self.memory_gate = nn.Sequential(
+            nn.Linear(self.dim * 2, self.dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.dim, self.dim),
+            nn.Sigmoid(),
+        ).to(self.device)
+        self.memory_fusion_norm = nn.LayerNorm(self.dim).to(self.device)
+        self.memory_attention = nn.Linear(self.dim, 1).to(self.device)
         self.domain_adapters = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(self.dim, self.dim),
@@ -67,6 +78,8 @@ class CLModel(nn.Module):
         ]).to(self.device)
         gate_input_dim = self.dim
         if self.use_speaker_state and self.use_state_in_domain_gate:
+            gate_input_dim += self.dim
+        if self.use_speaker_memory:
             gate_input_dim += self.dim
         if self.use_neutral_decoupling:
             gate_input_dim += 1
@@ -109,7 +122,17 @@ class CLModel(nn.Module):
         self.last_gate_entropy = None
         self.current_epoch = 0
         self.use_classifier_prototype_fusion = _flag(args, "use_classifier_prototype_fusion")
+        self.fusion_type = getattr(args, "fusion_type", "fixed")
         self.fusion_alpha = float(getattr(args, "fusion_alpha", 0.5))
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(self.dim + 3, self.dim // 2),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.dim // 2, 1),
+            nn.Sigmoid(),
+        ).to(self.device)
+        self.last_fusion_alpha = None
+        self.prototype_updates_stopped = False
 
     def device(self):
         return self.f_context_encoder.device
@@ -172,6 +195,30 @@ class CLModel(nn.Module):
         mask = state_attention_mask.unsqueeze(-1).float()
         return (state_encoded * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
 
+    def encode_speaker_memory(self, memory_input_ids=None, memory_attention_mask=None):
+        if not self.use_speaker_memory or memory_input_ids is None:
+            return None
+        if memory_attention_mask is None:
+            memory_attention_mask = (memory_input_ids != self.pad_value).long()
+        memory_encoded = self.f_context_encoder(
+            input_ids=memory_input_ids,
+            attention_mask=memory_attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        )["last_hidden_state"]
+        valid_counts = memory_attention_mask.sum(dim=1, keepdim=True)
+        if getattr(self.args, "speaker_memory_pooling", "attention") == "cls":
+            memory = memory_encoded[:, 0]
+        elif getattr(self.args, "speaker_memory_pooling", "attention") == "mean":
+            mask = memory_attention_mask.unsqueeze(-1).float()
+            memory = (memory_encoded * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+        else:
+            attn_logits = self.memory_attention(memory_encoded).squeeze(-1)
+            attn_logits = attn_logits.masked_fill(memory_attention_mask == 0, -1e4)
+            attn = F.softmax(attn_logits, dim=-1).unsqueeze(-1)
+            memory = (memory_encoded * attn).sum(dim=1)
+        return torch.where(valid_counts > 0, memory, torch.zeros_like(memory))
+
     def fuse_speaker_state(self, mask_outputs, state_outputs):
         if state_outputs is None or not self.use_state_fusion:
             return mask_outputs
@@ -179,19 +226,30 @@ class CLModel(nn.Module):
         state_alpha = self.state_gate(torch.cat([mask_outputs, state_projected], dim=-1))
         return self.state_fusion_norm(mask_outputs + state_alpha * state_projected)
 
-    def _domain_gate_input(self, fused_outputs, state_outputs=None, neutral_prob=None):
+    def fuse_speaker_memory(self, mask_outputs, memory_outputs):
+        if memory_outputs is None:
+            return mask_outputs
+        memory_projected = self.memory_proj(memory_outputs)
+        memory_alpha = self.memory_gate(torch.cat([mask_outputs, memory_projected], dim=-1))
+        return self.memory_fusion_norm(mask_outputs + memory_alpha * memory_projected)
+
+    def _domain_gate_input(self, fused_outputs, state_outputs=None, memory_outputs=None, neutral_prob=None):
         gate_inputs = [fused_outputs]
         if self.use_speaker_state and self.use_state_in_domain_gate:
             if state_outputs is None:
                 state_outputs = torch.zeros_like(fused_outputs)
             gate_inputs.append(state_outputs)
+        if self.use_speaker_memory:
+            if memory_outputs is None:
+                memory_outputs = torch.zeros_like(fused_outputs)
+            gate_inputs.append(memory_outputs)
         if self.use_neutral_decoupling:
             if neutral_prob is None:
                 neutral_prob = torch.zeros(fused_outputs.shape[0], 1, device=fused_outputs.device, dtype=fused_outputs.dtype)
             gate_inputs.append(neutral_prob)
         return torch.cat(gate_inputs, dim=-1)
 
-    def domain_gated_scores(self, mask_outputs, state_outputs=None, neutral_prob=None):
+    def domain_gated_scores(self, mask_outputs, state_outputs=None, memory_outputs=None, neutral_prob=None):
         anchors = self.get_domain_mapped_anchors()
         domain_features = []
         for adapter in self.domain_adapters:
@@ -203,7 +261,7 @@ class CLModel(nn.Module):
         )
         domain_logits = (domain_scores / self.args.temp).clamp(min=-50.0, max=50.0)
         domain_probs = F.softmax(domain_logits, dim=-1)
-        gate_input = self._domain_gate_input(mask_outputs, state_outputs, neutral_prob)
+        gate_input = self._domain_gate_input(mask_outputs, state_outputs, memory_outputs, neutral_prob)
         gate_logits = self.domain_gate(gate_input).clamp(min=-50.0, max=50.0)
         domain_weights = F.softmax(gate_logits, dim=-1)
         fused_probs = (domain_weights.unsqueeze(-1) * domain_probs).sum(dim=1)
@@ -234,15 +292,29 @@ class CLModel(nn.Module):
         feature = torch.dropout(fused_outputs, self.dropout, train=self.training)
         return self.predictor(feature)
 
-    def _fuse_logits(self, classifier_logits, prototype_logits):
+    def _fuse_logits(self, classifier_logits, prototype_logits, fused_outputs=None, neutral_prob=None):
         if not self.use_classifier_prototype_fusion:
+            self.last_fusion_alpha = None
             return prototype_logits
-        alpha = min(max(self.fusion_alpha, 0.0), 1.0)
+        if self.fusion_type == "adaptive" and fused_outputs is not None:
+            cls_conf = F.softmax(classifier_logits, dim=-1).max(dim=-1, keepdim=True)[0]
+            proto_conf = F.softmax(prototype_logits, dim=-1).max(dim=-1, keepdim=True)[0]
+            if neutral_prob is None:
+                neutral_prob = torch.zeros_like(cls_conf)
+            elif neutral_prob.dim() == 1:
+                neutral_prob = neutral_prob.unsqueeze(-1)
+            fusion_input = torch.cat([fused_outputs, cls_conf, proto_conf, neutral_prob], dim=-1)
+            alpha = self.fusion_gate(fusion_input).clamp(min=0.0, max=1.0)
+        else:
+            alpha = classifier_logits.new_full((classifier_logits.shape[0], 1), min(max(self.fusion_alpha, 0.0), 1.0))
+        self.last_fusion_alpha = alpha.detach()
         return alpha * classifier_logits + (1.0 - alpha) * prototype_logits
 
     @torch.no_grad()
     def update_anchors(self, raw_outputs, labels):
         if self.args.disable_anchor_updates:
+            return
+        if getattr(self, "prototype_updates_stopped", False):
             return
         freeze_epochs = getattr(self.args, "freeze_prototype_epochs", 0)
         if getattr(self, "current_epoch", 0) < freeze_epochs:
@@ -286,7 +358,7 @@ class CLModel(nn.Module):
                     new_anchor = F.normalize(new_anchor, dim=-1)
                 self.emo_anchor[class_id, subanchor_id].copy_(new_anchor)
     
-    def _forward(self, sentences, state_input_ids=None, state_attention_mask=None):
+    def _forward(self, sentences, state_input_ids=None, state_attention_mask=None, memory_input_ids=None, memory_attention_mask=None):
         mask = 1 - (sentences == (self.pad_value)).long()
 
         utterance_encoded = self.f_context_encoder(
@@ -298,13 +370,16 @@ class CLModel(nn.Module):
         mask_pos = (sentences == (self.mask_value)).long().max(1)[1]
         mask_outputs = utterance_encoded[torch.arange(mask_pos.shape[0]), mask_pos]
         state_outputs = self.encode_speaker_state(state_input_ids, state_attention_mask)
+        memory_outputs = self.encode_speaker_memory(memory_input_ids, memory_attention_mask)
         fused_outputs = self.fuse_speaker_state(mask_outputs, state_outputs)
+        fused_outputs = self.fuse_speaker_memory(fused_outputs, memory_outputs)
         neutral_logit = self.neutral_classifier(fused_outputs).squeeze(-1)
         neutral_prob = torch.sigmoid(neutral_logit).unsqueeze(-1)
         self.last_forward_output = {
             "neutral_logit": neutral_logit,
             "neutral_prob": neutral_prob,
             "state_outputs": state_outputs,
+            "memory_outputs": memory_outputs,
             "fused_outputs": fused_outputs,
         }
         if self.use_neutral_decoupling:
@@ -314,6 +389,7 @@ class CLModel(nn.Module):
                 prototype_logits, mask_mapped_outputs, _ = self.domain_gated_scores(
                     fused_outputs,
                     state_outputs=state_outputs,
+                    memory_outputs=memory_outputs,
                     neutral_prob=neutral_prob,
                 )
             else:
@@ -325,7 +401,7 @@ class CLModel(nn.Module):
                     anchors.unsqueeze(0)
                 )
                 prototype_logits = self.aggregate_subanchors(subanchor_scores)
-            non_neutral_logits = self._fuse_logits(non_neutral_classifier_logits, prototype_logits)
+            non_neutral_logits = self._fuse_logits(non_neutral_classifier_logits, prototype_logits, fused_outputs, neutral_prob)
             feature, final_probs, non_neutral_probs = self._expand_non_neutral_scores(non_neutral_logits, neutral_prob)
             anchor_scores = feature if self.args.use_nearest_neighbour else None
             self.last_forward_output.update({
@@ -344,10 +420,11 @@ class CLModel(nn.Module):
             prototype_logits, mask_mapped_outputs, _ = self.domain_gated_scores(
                 fused_outputs,
                 state_outputs=state_outputs,
+                memory_outputs=memory_outputs,
                 neutral_prob=neutral_prob if self.use_neutral_decoupling else None,
             )
             classifier_logits = self._classifier_logits(fused_outputs)
-            feature = self._fuse_logits(classifier_logits, prototype_logits)
+            feature = self._fuse_logits(classifier_logits, prototype_logits, fused_outputs, neutral_prob)
             anchor_scores = feature if self.args.use_nearest_neighbour else None
             self.last_forward_output.update({
                 "logits": feature,
@@ -374,7 +451,7 @@ class CLModel(nn.Module):
             if self.args.prototype_pooling == "entropy":
                 feature = prototype_logits
             if self.use_classifier_prototype_fusion:
-                feature = self._fuse_logits(classifier_logits, prototype_logits)
+                feature = self._fuse_logits(classifier_logits, prototype_logits, fused_outputs, neutral_prob)
                 anchor_scores = feature
             
         else:
@@ -389,7 +466,7 @@ class CLModel(nn.Module):
         })
         return feature, mask_mapped_outputs, mask_outputs, anchor_scores
     
-    def forward(self, sentences, state_input_ids=None, state_attention_mask=None, return_mask_output=False):
+    def forward(self, sentences, state_input_ids=None, state_attention_mask=None, memory_input_ids=None, memory_attention_mask=None, return_mask_output=False):
         '''
         generate vector representations for each turn of conversation
         '''
@@ -397,6 +474,8 @@ class CLModel(nn.Module):
             sentences,
             state_input_ids=state_input_ids,
             state_attention_mask=state_attention_mask,
+            memory_input_ids=memory_input_ids,
+            memory_attention_mask=memory_attention_mask,
         )
         
         if return_mask_output:

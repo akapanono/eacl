@@ -43,12 +43,19 @@ BASE_CONFIG = {
     "use_nearest_neighbour": True,
     "use_neutral_decoupling": True,
     "use_speaker_state": True,
+    "use_speaker_memory": False,
+    "speaker_memory_k": 3,
+    "speaker_memory_pooling": "attention",
     "use_similar_anchor_separation": True,
     "use_hard_anchor_negative": True,
+    "hard_negative_schedule": "constant",
     "class_balanced_ce": True,
     "disable_anchor_updates": False,
     "use_classifier_prototype_fusion": False,
+    "fusion_type": "fixed",
     "fusion_alpha": 0.5,
+    "use_neutral_aware_supcon": False,
+    "prototype_update_policy": "momentum",
     "accumulation_step": 1,
 }
 
@@ -83,6 +90,24 @@ def candidate_configs():
         make_config("F1_fusion_alpha03", "fusion", use_classifier_prototype_fusion=True, fusion_alpha=0.3),
         make_config("F2_fusion_alpha05", "fusion", use_classifier_prototype_fusion=True, fusion_alpha=0.5),
         make_config("F3_fusion_alpha07", "fusion", use_classifier_prototype_fusion=True, fusion_alpha=0.7),
+        make_config("S1_speaker_memory_mean", "smf", use_speaker_state=False, use_speaker_memory=True, speaker_memory_pooling="mean"),
+        make_config("S2_speaker_memory_attention", "smf", use_speaker_state=False, use_speaker_memory=True, speaker_memory_pooling="attention"),
+        make_config("S3_adaptive_fusion", "smf", use_classifier_prototype_fusion=True, fusion_type="adaptive"),
+        make_config("S4_memory_adaptive_fusion", "smf", use_speaker_state=False, use_speaker_memory=True, use_classifier_prototype_fusion=True, fusion_type="adaptive"),
+        make_config("S5_neutral_aware_supcon", "smf", use_neutral_aware_supcon=True),
+        make_config("S6_curriculum_hard", "smf", hard_negative_schedule="curriculum"),
+        make_config("S7_validation_guarded_proto", "smf", prototype_update_policy="validation_guarded"),
+        make_config(
+            "S8_smf_full",
+            "smf",
+            use_speaker_state=False,
+            use_speaker_memory=True,
+            use_classifier_prototype_fusion=True,
+            fusion_type="adaptive",
+            use_neutral_aware_supcon=True,
+            hard_negative_schedule="curriculum",
+            prototype_update_policy="validation_guarded",
+        ),
     ]
     return [{"trial": idx, "seed": 4668, **cfg} for idx, cfg in enumerate(configs, start=1)]
 
@@ -111,6 +136,8 @@ def filter_configs(configs, experiment_set):
         return [cfg for cfg in configs if cfg["group"] in ["baseline", "targeted"]]
     if experiment_set == "fusion":
         return [cfg for cfg in configs if cfg["group"] in ["baseline", "fusion"]]
+    if experiment_set == "smf":
+        return [cfg for cfg in configs if cfg["group"] in ["baseline", "smf"]]
     return configs
 
 
@@ -154,6 +181,11 @@ def build_command(args, cfg, save_path):
         "--save_best_metric", "valid",
         "--save_path", str(save_path) + "/",
         "--accumulation_step", str(cfg["accumulation_step"]),
+        "--speaker_memory_k", str(cfg["speaker_memory_k"]),
+        "--speaker_memory_pooling", cfg["speaker_memory_pooling"],
+        "--fusion_type", cfg["fusion_type"],
+        "--hard_negative_schedule", cfg["hard_negative_schedule"],
+        "--prototype_update_policy", cfg["prototype_update_policy"],
         "--normalize_prototypes_after_update",
         "--disable_training_progress_bar",
     ]
@@ -163,6 +195,8 @@ def build_command(args, cfg, save_path):
         cmd.append("--use_neutral_decoupling")
     if cfg["use_speaker_state"]:
         cmd.append("--use_speaker_state")
+    if cfg["use_speaker_memory"]:
+        cmd.append("--use_speaker_memory")
     if cfg["use_similar_anchor_separation"]:
         cmd.append("--use_similar_anchor_separation")
     if cfg["use_hard_anchor_negative"]:
@@ -173,6 +207,8 @@ def build_command(args, cfg, save_path):
         cmd.append("--disable_anchor_updates")
     if cfg["use_classifier_prototype_fusion"]:
         cmd.extend(["--use_classifier_prototype_fusion", "--fusion_alpha", fmt_float(cfg["fusion_alpha"])])
+    if cfg["use_neutral_aware_supcon"]:
+        cmd.append("--use_neutral_aware_supcon")
     return cmd
 
 
@@ -215,8 +251,10 @@ def write_tables(rows, summary_path, leaderboard_path):
         "lambda_angle", "lambda_sas", "lambda_hard", "lambda_gate_entropy",
         "sas_margin", "hard_negative_rho", "hard_negative_temperature", "prototype_pooling",
         "use_nearest_neighbour", "use_neutral_decoupling", "use_speaker_state",
+        "use_speaker_memory", "speaker_memory_k", "speaker_memory_pooling",
         "use_similar_anchor_separation", "use_hard_anchor_negative", "class_balanced_ce",
-        "disable_anchor_updates", "use_classifier_prototype_fusion", "fusion_alpha",
+        "hard_negative_schedule", "disable_anchor_updates", "use_classifier_prototype_fusion",
+        "fusion_type", "fusion_alpha", "use_neutral_aware_supcon", "prototype_update_policy",
         "accumulation_step", "confusion_matrix", "similar_pair_confusion",
         "duration_sec", "returncode", "run_dir", "stdout_log", "logging_log", "command",
     ]
@@ -245,7 +283,7 @@ def main():
     parser.add_argument("--anchor-path", type=Path, default=Path("emo_anchors/sup-simcse-roberta-large"))
     parser.add_argument("--num-subanchors", type=int, default=4)
     parser.add_argument("--prototype-pooling", default="domain_gated", choices=["domain_gated", "max", "logsumexp", "entropy"])
-    parser.add_argument("--experiment-set", default="all", choices=["all", "ablation", "targeted", "fusion"],
+    parser.add_argument("--experiment-set", default="all", choices=["all", "ablation", "targeted", "fusion", "smf"],
                         help="Which predefined next-round experiments to run.")
     parser.add_argument("--early-stop-patience", type=int, default=5)
     parser.add_argument("--similar-emotion-pairs", default="happy:excited,sad:frustrated,angry:frustrated")

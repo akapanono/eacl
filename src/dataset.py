@@ -12,6 +12,8 @@ DEFAULT_SPEAKER_STATE = {
     "context_shift": "unknown.",
 }
 
+DEFAULT_SPEAKER_MEMORY = ""
+
 class DialogueDataset(Dataset):    
     def __init__(self, args, dataset_name = 'IEMOCAP', split = 'train', speaker_vocab=None, label_vocab=None, tokenizer = None):
         self.speaker_vocab = speaker_vocab
@@ -86,7 +88,14 @@ class DialogueDataset(Dataset):
                 query_idx = idx
                 input_ids = full_context[:-len(utterance_ids[query_idx])]
                 speaker_state = turn_data.get("speaker_state", DEFAULT_SPEAKER_STATE)
-                ret_utterances.append((input_ids, turn_data['speaker'], turn_data['text'], speaker_state))# input_ids, speaker
+                memory_k = max(0, int(getattr(self.args, "speaker_memory_k", 3)))
+                speaker_memory = [
+                    prev_turn.get("text", "")
+                    for prev_turn in dialogue[:idx]
+                    if prev_turn.get("speaker") == turn_data.get("speaker")
+                ][-memory_k:]
+                speaker_memory_text = " </s> ".join([item for item in speaker_memory if item])
+                ret_utterances.append((input_ids, turn_data['speaker'], turn_data['text'], speaker_state, speaker_memory_text))# input_ids, speaker
                 ret_labels.append(dialogue[query_idx]['label'])
 
                 utterance_seq.append({
@@ -111,7 +120,7 @@ class DialogueDataset(Dataset):
         )
 
     def process(self, data):
-        input_ids, speaker, text, _ = data
+        input_ids, speaker, text = data[:3]
         # print(input_ids)
         p2 = 'For utterance: '+ text + " " + speaker + " feels <mask> "
         p2 = self.tokenizer(p2)['input_ids'][1:]
@@ -122,13 +131,25 @@ class DialogueDataset(Dataset):
         return p2
 
     def process_speaker_state(self, data):
-        _, _, _, speaker_state = data
+        speaker_state = data[3] if len(data) > 3 else DEFAULT_SPEAKER_STATE
         state_text = self.format_speaker_state(speaker_state)
         state_ids = self.tokenizer(state_text)["input_ids"]
         state_ids = pad_to_len(state_ids, self.state_max_len, self.pad_value)
         state_ids = torch.LongTensor(state_ids)
         state_mask = (state_ids != self.pad_value).long()
         return state_ids, state_mask
+
+    def process_speaker_memory(self, data):
+        memory_text = data[4] if len(data) > 4 else DEFAULT_SPEAKER_MEMORY
+        max_len = getattr(self.args, "speaker_memory_max_len", 128)
+        if not memory_text:
+            memory_ids = [self.pad_value] * max_len
+        else:
+            memory_ids = self.tokenizer(memory_text)["input_ids"]
+            memory_ids = pad_to_len(memory_ids, max_len, self.pad_value)
+        memory_ids = torch.LongTensor(memory_ids)
+        memory_mask = (memory_ids != self.pad_value).long()
+        return memory_ids, memory_mask
 
     def save_path(self, dataset_name):
         return f'./data/{dataset_name}/processed/{self.split}'
@@ -138,6 +159,14 @@ class DialogueDataset(Dataset):
         raw_data = text
         text = self.process(raw_data)
         label = self.labels[index]
+        if getattr(self.args, "use_speaker_memory", False):
+            if getattr(self.args, "use_speaker_state", False):
+                state_ids, state_mask = self.process_speaker_state(raw_data)
+            else:
+                state_ids = torch.LongTensor([self.pad_value] * self.state_max_len)
+                state_mask = torch.zeros(self.state_max_len, dtype=torch.long)
+            memory_ids, memory_mask = self.process_speaker_memory(raw_data)
+            return text, label, state_ids, state_mask, memory_ids, memory_mask
         if getattr(self.args, "use_speaker_state", False):
             state_ids, state_mask = self.process_speaker_state(raw_data)
             return text, label, state_ids, state_mask
