@@ -20,77 +20,71 @@ def safe_tag(value):
     return str(value).replace(".", "p").replace("-", "m")
 
 
+BASE_CONFIG = {
+    "lr": 5e-5,
+    "ptmlr": 5e-6,
+    "dropout": 0.25,
+    "batch_size": 8,
+    "temp": 0.3,
+    "prototype_pooling": "domain_gated",
+    "prototype_momentum": 0.995,
+    "max_grad_norm": 0.5,
+    "freeze_prototype_epochs": 3,
+    "ce_loss_weight": 0.4,
+    "lambda_neu": 0.2,
+    "lambda_supcon": 0.2,
+    "lambda_angle": 0.01,
+    "lambda_sas": 0.002,
+    "lambda_hard": 0.005,
+    "lambda_gate_entropy": 0.001,
+    "sas_margin": 0.30,
+    "hard_negative_rho": 0.5,
+    "hard_negative_temperature": 0.2,
+    "use_nearest_neighbour": True,
+    "use_neutral_decoupling": True,
+    "use_speaker_state": True,
+    "use_similar_anchor_separation": True,
+    "use_hard_anchor_negative": True,
+    "class_balanced_ce": True,
+    "disable_anchor_updates": False,
+    "use_classifier_prototype_fusion": False,
+    "fusion_alpha": 0.5,
+    "accumulation_step": 1,
+}
+
+
+def make_config(name, group, **overrides):
+    cfg = {"name": name, "group": group, **BASE_CONFIG}
+    cfg.update(overrides)
+    return cfg
+
+
 def candidate_configs():
-    seeds = [49, 4668, 12334]
     configs = [
-        {
-            "lr": 5e-5,
-            "ptmlr": 5e-6,
-            "dropout": 0.25,
-            "batch_size": 8,
-            "temp": 0.3,
-            "prototype_momentum": 0.995,
-            "ce_loss_weight": 0.4,
-            "lambda_neu": 0.2,
-            "lambda_supcon": 0.2,
-            "lambda_angle": 0.01,
-            "lambda_sas": 0.002,
-            "lambda_hard": 0.005,
-            "lambda_gate_entropy": 0.001,
-            "sas_margin": 0.30,
-            "hard_negative_rho": 0.5,
-            "hard_negative_temperature": 0.2,
-            "max_grad_norm": 0.5,
-            "freeze_prototype_epochs": 3,
-        },
-        {
-            "lr": 5e-5,
-            "ptmlr": 1e-5,
-            "dropout": 0.25,
-            "batch_size": 8,
-            "temp": 0.3,
-            "prototype_momentum": 0.99,
-            "ce_loss_weight": 0.5,
-            "lambda_neu": 0.2,
-            "lambda_supcon": 0.2,
-            "lambda_angle": 0.01,
-            "lambda_sas": 0.005,
-            "lambda_hard": 0.01,
-            "lambda_gate_entropy": 0.001,
-            "sas_margin": 0.30,
-            "hard_negative_rho": 1.0,
-            "hard_negative_temperature": 0.1,
-            "max_grad_norm": 1.0,
-            "freeze_prototype_epochs": 2,
-        },
-        {
-            "lr": 8e-5,
-            "ptmlr": 8e-6,
-            "dropout": 0.3,
-            "batch_size": 8,
-            "temp": 0.5,
-            "prototype_momentum": 0.995,
-            "ce_loss_weight": 0.4,
-            "lambda_neu": 0.1,
-            "lambda_supcon": 0.1,
-            "lambda_angle": 0.005,
-            "lambda_sas": 0.002,
-            "lambda_hard": 0.005,
-            "lambda_gate_entropy": 0.001,
-            "sas_margin": 0.35,
-            "hard_negative_rho": 0.5,
-            "hard_negative_temperature": 0.2,
-            "max_grad_norm": 0.5,
-            "freeze_prototype_epochs": 3,
-        },
+        make_config("B0_baseline_trial004", "baseline"),
+        make_config("A1_no_hard", "ablation", use_hard_anchor_negative=False, lambda_hard=0.0),
+        make_config("A2_no_sas_no_hard", "ablation", use_similar_anchor_separation=False, use_hard_anchor_negative=False, lambda_sas=0.0, lambda_hard=0.0),
+        make_config("A3_no_speaker_state", "ablation", use_speaker_state=False),
+        make_config("A4_no_neutral_decoupling", "ablation", use_neutral_decoupling=False),
+        make_config("A5_no_class_balanced_ce", "ablation", class_balanced_ce=False),
+        make_config("A6_logsumexp_pooling", "ablation", prototype_pooling="logsumexp"),
+        make_config("A7_entropy_pooling", "ablation", prototype_pooling="entropy"),
+        make_config("A8_freeze8", "ablation", freeze_prototype_epochs=8),
+        make_config("R1_stronger_ce", "targeted", ce_loss_weight=0.6, lambda_supcon=0.1, lambda_neu=0.1, lambda_sas=0.001, lambda_hard=0.002),
+        make_config("R2_ce_heavy_no_hard", "targeted", ce_loss_weight=0.7, lambda_supcon=0.05, lambda_neu=0.1, lambda_sas=0.001, lambda_hard=0.0, use_hard_anchor_negative=False),
+        make_config("R3_no_hard", "targeted", use_hard_anchor_negative=False, lambda_hard=0.0),
+        make_config("R4_no_sas_no_hard", "targeted", use_similar_anchor_separation=False, use_hard_anchor_negative=False, lambda_sas=0.0, lambda_hard=0.0),
+        make_config("R5_dropout020", "targeted", dropout=0.20),
+        make_config("R6_dropout015", "targeted", dropout=0.15),
+        make_config("R7_batch16_temp03", "targeted", batch_size=16, temp=0.3),
+        make_config("R8_batch16_temp02", "targeted", batch_size=16, temp=0.2),
+        make_config("R9_logsumexp_pooling", "targeted", prototype_pooling="logsumexp"),
+        make_config("R10_freeze8", "targeted", freeze_prototype_epochs=8, prototype_momentum=0.995),
+        make_config("F1_fusion_alpha03", "fusion", use_classifier_prototype_fusion=True, fusion_alpha=0.3),
+        make_config("F2_fusion_alpha05", "fusion", use_classifier_prototype_fusion=True, fusion_alpha=0.5),
+        make_config("F3_fusion_alpha07", "fusion", use_classifier_prototype_fusion=True, fusion_alpha=0.7),
     ]
-    expanded = []
-    trial = 1
-    for seed in seeds:
-        for cfg in configs:
-            expanded.append({"trial": trial, "seed": seed, **cfg})
-            trial += 1
-    return expanded
+    return [{"trial": idx, "seed": 4668, **cfg} for idx, cfg in enumerate(configs, start=1)]
 
 
 def ensure_anchors(args):
@@ -106,6 +100,18 @@ def ensure_anchors(args):
         "--num_subanchors",
         str(args.num_subanchors),
     ])
+
+
+def filter_configs(configs, experiment_set):
+    if experiment_set == "all":
+        return configs
+    if experiment_set == "ablation":
+        return [cfg for cfg in configs if cfg["group"] in ["baseline", "ablation"]]
+    if experiment_set == "targeted":
+        return [cfg for cfg in configs if cfg["group"] in ["baseline", "targeted"]]
+    if experiment_set == "fusion":
+        return [cfg for cfg in configs if cfg["group"] in ["baseline", "fusion"]]
+    return configs
 
 
 def build_command(args, cfg, save_path):
@@ -124,7 +130,7 @@ def build_command(args, cfg, save_path):
         "--temp", fmt_float(cfg["temp"]),
         "--seed", str(cfg["seed"]),
         "--num_subanchors", str(args.num_subanchors),
-        "--prototype_pooling", args.prototype_pooling,
+        "--prototype_pooling", cfg["prototype_pooling"],
         "--prototype_momentum", fmt_float(cfg["prototype_momentum"]),
         "--max_grad_norm", fmt_float(cfg["max_grad_norm"]),
         "--freeze_prototype_epochs", str(cfg["freeze_prototype_epochs"]),
@@ -147,29 +153,40 @@ def build_command(args, cfg, save_path):
         "--early_stop_metric", "valid",
         "--save_best_metric", "valid",
         "--save_path", str(save_path) + "/",
-        "--use_nearest_neighbour",
-        "--use_neutral_decoupling",
-        "--use_speaker_state",
-        "--use_similar_anchor_separation",
-        "--use_hard_anchor_negative",
+        "--accumulation_step", str(cfg["accumulation_step"]),
         "--normalize_prototypes_after_update",
-        "--class_balanced_ce",
         "--disable_training_progress_bar",
     ]
-    if args.disable_anchor_updates:
+    if cfg["use_nearest_neighbour"]:
+        cmd.append("--use_nearest_neighbour")
+    if cfg["use_neutral_decoupling"]:
+        cmd.append("--use_neutral_decoupling")
+    if cfg["use_speaker_state"]:
+        cmd.append("--use_speaker_state")
+    if cfg["use_similar_anchor_separation"]:
+        cmd.append("--use_similar_anchor_separation")
+    if cfg["use_hard_anchor_negative"]:
+        cmd.append("--use_hard_anchor_negative")
+    if cfg["class_balanced_ce"]:
+        cmd.append("--class_balanced_ce")
+    if cfg["disable_anchor_updates"] or args.disable_anchor_updates:
         cmd.append("--disable_anchor_updates")
+    if cfg["use_classifier_prototype_fusion"]:
+        cmd.extend(["--use_classifier_prototype_fusion", "--fusion_alpha", fmt_float(cfg["fusion_alpha"])])
     return cmd
 
 
 def run_name(cfg):
     parts = [
         f"trial{cfg['trial']:03d}",
+        cfg["name"],
         f"seed{cfg['seed']}",
         f"lr{safe_tag(fmt_float(cfg['lr']))}",
         f"ptm{safe_tag(fmt_float(cfg['ptmlr']))}",
         f"drop{safe_tag(fmt_float(cfg['dropout']))}",
         f"bs{cfg['batch_size']}",
         f"temp{safe_tag(fmt_float(cfg['temp']))}",
+        f"pool{cfg['prototype_pooling']}",
         f"mom{safe_tag(fmt_float(cfg['prototype_momentum']))}",
         f"ce{safe_tag(fmt_float(cfg['ce_loss_weight']))}",
     ]
@@ -192,11 +209,15 @@ def parse_result(log_text):
 
 def write_tables(rows, summary_path, leaderboard_path):
     fieldnames = [
-        "status", "trial", "seed", "best_test", "best_test_epoch", "best_valid", "best_valid_epoch",
+        "status", "trial", "name", "group", "seed", "best_test", "best_test_epoch", "best_valid", "best_valid_epoch",
         "lr", "ptmlr", "dropout", "batch_size", "temp", "prototype_momentum",
         "max_grad_norm", "freeze_prototype_epochs", "ce_loss_weight", "lambda_neu", "lambda_supcon",
         "lambda_angle", "lambda_sas", "lambda_hard", "lambda_gate_entropy",
-        "sas_margin", "hard_negative_rho", "hard_negative_temperature",
+        "sas_margin", "hard_negative_rho", "hard_negative_temperature", "prototype_pooling",
+        "use_nearest_neighbour", "use_neutral_decoupling", "use_speaker_state",
+        "use_similar_anchor_separation", "use_hard_anchor_negative", "class_balanced_ce",
+        "disable_anchor_updates", "use_classifier_prototype_fusion", "fusion_alpha",
+        "accumulation_step", "confusion_matrix", "similar_pair_confusion",
         "duration_sec", "returncode", "run_dir", "stdout_log", "logging_log", "command",
     ]
     for path, data in [
@@ -224,6 +245,8 @@ def main():
     parser.add_argument("--anchor-path", type=Path, default=Path("emo_anchors/sup-simcse-roberta-large"))
     parser.add_argument("--num-subanchors", type=int, default=4)
     parser.add_argument("--prototype-pooling", default="domain_gated", choices=["domain_gated", "max", "logsumexp", "entropy"])
+    parser.add_argument("--experiment-set", default="all", choices=["all", "ablation", "targeted", "fusion"],
+                        help="Which predefined next-round experiments to run.")
     parser.add_argument("--early-stop-patience", type=int, default=5)
     parser.add_argument("--similar-emotion-pairs", default="happy:excited,sad:frustrated,angry:frustrated")
     parser.add_argument("--disable-anchor-updates", action="store_true")
@@ -239,11 +262,11 @@ def main():
     leaderboard_path = queue_root / "leaderboard.csv"
 
     ensure_anchors(args)
-    configs = candidate_configs()
+    configs = filter_configs(candidate_configs(), args.experiment_set)
     if args.max_runs > 0:
         configs = configs[:args.max_runs]
 
-    print(f"[queue] dataset={args.dataset} gpu={args.gpu_id} epochs={args.epochs} runs={len(configs)}", flush=True)
+    print(f"[queue] dataset={args.dataset} gpu={args.gpu_id} epochs={args.epochs} set={args.experiment_set} runs={len(configs)}", flush=True)
     print(f"[queue] output={queue_root.resolve()}", flush=True)
 
     rows = []
@@ -254,6 +277,8 @@ def main():
         save_path = run_dir / "saved_models"
         stdout_log = run_dir / "train.stdout.log"
         logging_log = save_path / args.dataset / "logging.log"
+        confusion_matrix = save_path / args.dataset / "confusion_matrix.csv"
+        similar_pair_confusion = save_path / args.dataset / "similar_pair_confusion.csv"
         cmd = build_command(args, cfg, save_path)
         command_text = subprocess.list2cmdline(cmd)
         print(f"\n[run] {name}", flush=True)
@@ -285,6 +310,8 @@ def main():
             "run_dir": str(run_dir),
             "stdout_log": str(stdout_log),
             "logging_log": str(logging_log),
+            "confusion_matrix": str(confusion_matrix) if confusion_matrix.exists() else "",
+            "similar_pair_confusion": str(similar_pair_confusion) if similar_pair_confusion.exists() else "",
             "command": command_text,
         }
         rows.append(row)

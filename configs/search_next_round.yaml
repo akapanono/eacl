@@ -1,0 +1,58 @@
+dataset_name: IEMOCAP
+epochs: 30
+seed: 4668
+
+backbone:
+  bert_path: pretrained/sup-simcse-roberta-large
+  anchor_path: emo_anchors/sup-simcse-roberta-large
+
+base:
+  lr: 5e-5
+  ptmlr: 5e-6
+  dropout: 0.25
+  batch_size: 8
+  temp: 0.3
+  num_subanchors: 4
+  prototype_pooling: domain_gated
+  prototype_momentum: 0.995
+  freeze_prototype_epochs: 3
+  normalize_prototypes_after_update: true
+  max_grad_norm: 0.5
+  lr_scheduler: cosine
+  warmup_ratio: 0.08
+  early_stop_patience: 5
+  early_stop_metric: valid
+  save_best_metric: valid
+  ce_loss_weight: 0.4
+  angle_loss_weight: 0.01
+  lambda_neu: 0.2
+  lambda_supcon: 0.2
+  lambda_angle: 0.01
+  lambda_sas: 0.002
+  lambda_hard: 0.005
+  lambda_gate_entropy: 0.001
+  sas_margin: 0.3
+  hard_negative_rho: 0.5
+  hard_negative_temperature: 0.2
+  accumulation_step: 1
+
+similar_emotion_pairs:
+  - happy:excited
+  - sad:frustrated
+  - angry:frustrated
+
+modules:
+  use_nearest_neighbour: true
+  use_neutral_decoupling: true
+  use_speaker_state: true
+  use_similar_anchor_separation: true
+  use_hard_anchor_negative: true
+  class_balanced_ce: true
+  use_classifier_prototype_fusion: false
+  fusion_alpha: 0.5
+
+experiment_sets:
+  all: baseline + A1-A8 + R1-R10 + F1-F3
+  ablation: baseline + A1-A8
+  targeted: baseline + R1-R10
+  fusion: baseline + F1-F3

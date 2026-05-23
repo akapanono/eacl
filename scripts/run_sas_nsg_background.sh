@@ -5,6 +5,7 @@ DATASET="${DATASET:-IEMOCAP}"
 GPU_ID="${GPU_ID:-0}"
 EPOCHS="${EPOCHS:-30}"
 MAX_RUNS="${MAX_RUNS:-0}"
+EXPERIMENT_SET="${EXPERIMENT_SET:-all}"
 OUT_ROOT="${OUT_ROOT:-run_logs/sas_nsg_queue}"
 BERT_PATH="${BERT_PATH:-pretrained/sup-simcse-roberta-large}"
 ANCHOR_PATH="${ANCHOR_PATH:-emo_anchors/sup-simcse-roberta-large}"
@@ -19,6 +20,7 @@ nohup python scripts/sas_nsg_train_queue.py \
   --gpu-id "${GPU_ID}" \
   --epochs "${EPOCHS}" \
   --max-runs "${MAX_RUNS}" \
+  --experiment-set "${EXPERIMENT_SET}" \
   --bert-path "${BERT_PATH}" \
   --anchor-path "${ANCHOR_PATH}" \
   --out-root "${OUT_ROOT}" \

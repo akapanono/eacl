@@ -14,6 +14,7 @@ warnings.filterwarnings("ignore")
 import logging
 from utils.data_process import *
 from model.model import CLModel, Classifier
+from model.anchor_utils import get_dataset_emotions
 from model.loss import loss_function
 import pickle
 os.environ["TOKENIZERS_PARALLELISM"] = "1"
@@ -126,6 +127,8 @@ def get_parser():
                         help='max content length for each text, if set to 0, then the max length has no constrain')
     parser.add_argument("--temp", type=float, default=0.5)
     parser.add_argument('--accumulation_step', type=int, default=1)
+    parser.add_argument('--gradient_accumulation_steps', dest='accumulation_step', type=int,
+                        help='Alias for --accumulation_step.')
     parser.add_argument('--no_cuda', action='store_true', default=False, help='does not use GPU')
     parser.add_argument('--gpu_id', type=int, default=1, help='GPU id to use when CUDA is available')
 
@@ -190,6 +193,10 @@ def get_parser():
     parser.add_argument("--disable_prototype_normalization", action="store_true")
     parser.add_argument("--use_similar_anchor_separation", action="store_true")
     parser.add_argument("--use_hard_anchor_negative", action="store_true")
+    parser.add_argument("--use_classifier_prototype_fusion", action="store_true",
+                        help="Fuse classifier-head logits with prototype-head logits.")
+    parser.add_argument("--fusion_alpha", type=float, default=0.5,
+                        help="Classifier weight in classifier/prototype fusion.")
     parser.add_argument("--similar_emotion_pairs", type=str, default="happy:excited,sad:frustrated,angry:frustrated")
     parser.add_argument("--sas_margin", type=float, default=0.30)
     parser.add_argument("--hard_negative_rho", type=float, default=1.0)
@@ -217,6 +224,65 @@ def get_parser():
     if args.disable_prototype_normalization:
         args.normalize_prototypes_after_update = False
     return args
+
+def parse_similar_pairs_text(pairs):
+    parsed = []
+    for item in str(pairs).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            left, right = item.split(":", 1)
+        elif "-" in item:
+            left, right = item.split("-", 1)
+        else:
+            continue
+        parsed.append((left.strip().lower(), right.strip().lower()))
+    return parsed
+
+def flatten_eval_tensors(label_batches, pred_batches):
+    labels, preds = [], []
+    for batch_labels, batch_preds in zip(label_batches, pred_batches):
+        for label, pred in zip(batch_labels, batch_preds):
+            label_value = int(label.detach().cpu().item())
+            if label_value == -1:
+                continue
+            labels.append(label_value)
+            preds.append(int(pred.detach().cpu().item()))
+    return labels, preds
+
+def save_confusion_reports(args, label_batches, pred_batches):
+    labels, preds = flatten_eval_tensors(label_batches, pred_batches)
+    if not labels:
+        return
+    label_names = get_dataset_emotions(args.dataset_name)
+    n_classes = len(label_names)
+    matrix = np.zeros((n_classes, n_classes), dtype=int)
+    for label, pred in zip(labels, preds):
+        if 0 <= label < n_classes and 0 <= pred < n_classes:
+            matrix[label, pred] += 1
+
+    out_dir = os.path.join(args.save_path, args.dataset_name)
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "confusion_matrix.csv"), "w", encoding="utf-8") as f:
+        f.write("label," + ",".join(label_names) + "\n")
+        for idx, name in enumerate(label_names):
+            f.write(name + "," + ",".join(str(value) for value in matrix[idx].tolist()) + "\n")
+
+    label_to_id = {name.lower(): idx for idx, name in enumerate(label_names)}
+    with open(os.path.join(out_dir, "similar_pair_confusion.csv"), "w", encoding="utf-8") as f:
+        f.write("left,right,left_to_right,right_to_left,total,count_left,count_right,rate\n")
+        for left, right in parse_similar_pairs_text(args.similar_emotion_pairs):
+            if left not in label_to_id or right not in label_to_id:
+                continue
+            left_id = label_to_id[left]
+            right_id = label_to_id[right]
+            left_to_right = int(matrix[left_id, right_id])
+            right_to_left = int(matrix[right_id, left_id])
+            total = left_to_right + right_to_left
+            denom = int(matrix[left_id].sum() + matrix[right_id].sum())
+            rate = total / denom if denom else 0.0
+            f.write(f"{left},{right},{left_to_right},{right_to_left},{total},{int(matrix[left_id].sum())},{int(matrix[right_id].sum())},{rate:.6f}\n")
 
 if __name__ == '__main__':
     args = get_parser()
@@ -336,6 +402,7 @@ if __name__ == '__main__':
             best_model = copy.deepcopy(model)
             best_checkpoint_score = checkpoint_score
             torch.save(model.state_dict(), path + args.dataset_name + '/model_' + '.pkl')
+            save_confusion_reports(args, test_label, test_pred)
 
         current_early_stop_score = test_fscore if args.early_stop_metric == "test" else valid_fscore
         if current_early_stop_score > early_stop_score:

@@ -108,6 +108,8 @@ class CLModel(nn.Module):
         self.last_forward_output = {}
         self.last_gate_entropy = None
         self.current_epoch = 0
+        self.use_classifier_prototype_fusion = _flag(args, "use_classifier_prototype_fusion")
+        self.fusion_alpha = float(getattr(args, "fusion_alpha", 0.5))
 
     def device(self):
         return self.f_context_encoder.device
@@ -228,6 +230,16 @@ class CLModel(nn.Module):
         final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True).clamp_min(self.eps)
         return torch.log(final_probs + self.eps), final_probs, p_emo
 
+    def _classifier_logits(self, fused_outputs):
+        feature = torch.dropout(fused_outputs, self.dropout, train=self.training)
+        return self.predictor(feature)
+
+    def _fuse_logits(self, classifier_logits, prototype_logits):
+        if not self.use_classifier_prototype_fusion:
+            return prototype_logits
+        alpha = min(max(self.fusion_alpha, 0.0), 1.0)
+        return alpha * classifier_logits + (1.0 - alpha) * prototype_logits
+
     @torch.no_grad()
     def update_anchors(self, raw_outputs, labels):
         if self.args.disable_anchor_updates:
@@ -296,8 +308,10 @@ class CLModel(nn.Module):
             "fused_outputs": fused_outputs,
         }
         if self.use_neutral_decoupling:
+            classifier_logits = self._classifier_logits(fused_outputs)
+            non_neutral_classifier_logits = classifier_logits[:, self.non_neutral_to_original]
             if self.args.prototype_pooling == "domain_gated":
-                non_neutral_logits, mask_mapped_outputs, _ = self.domain_gated_scores(
+                prototype_logits, mask_mapped_outputs, _ = self.domain_gated_scores(
                     fused_outputs,
                     state_outputs=state_outputs,
                     neutral_prob=neutral_prob,
@@ -310,12 +324,15 @@ class CLModel(nn.Module):
                     mask_mapped_outputs.unsqueeze(1).unsqueeze(2),
                     anchors.unsqueeze(0)
                 )
-                non_neutral_logits = self.aggregate_subanchors(subanchor_scores)
+                prototype_logits = self.aggregate_subanchors(subanchor_scores)
+            non_neutral_logits = self._fuse_logits(non_neutral_classifier_logits, prototype_logits)
             feature, final_probs, non_neutral_probs = self._expand_non_neutral_scores(non_neutral_logits, neutral_prob)
             anchor_scores = feature if self.args.use_nearest_neighbour else None
             self.last_forward_output.update({
                 "logits": feature,
                 "probs": final_probs,
+                "classifier_logits": classifier_logits,
+                "prototype_logits": prototype_logits,
                 "non_neutral_logits": non_neutral_logits,
                 "non_neutral_probs": non_neutral_probs,
                 "mask_mapped_outputs": mask_mapped_outputs,
@@ -324,22 +341,27 @@ class CLModel(nn.Module):
             })
             return feature, mask_mapped_outputs, mask_outputs, anchor_scores
         if self.args.prototype_pooling == "domain_gated":
-            feature, mask_mapped_outputs, _ = self.domain_gated_scores(
+            prototype_logits, mask_mapped_outputs, _ = self.domain_gated_scores(
                 fused_outputs,
                 state_outputs=state_outputs,
                 neutral_prob=neutral_prob if self.use_neutral_decoupling else None,
             )
+            classifier_logits = self._classifier_logits(fused_outputs)
+            feature = self._fuse_logits(classifier_logits, prototype_logits)
             anchor_scores = feature if self.args.use_nearest_neighbour else None
             self.last_forward_output.update({
                 "logits": feature,
+                "classifier_logits": classifier_logits,
+                "prototype_logits": prototype_logits,
                 "mask_mapped_outputs": mask_mapped_outputs,
                 "raw_outputs": mask_outputs,
                 "anchor_scores": anchor_scores,
             })
             return feature, mask_mapped_outputs, mask_outputs, anchor_scores
         mask_mapped_outputs = self.map_function(fused_outputs)
-        feature = torch.dropout(fused_outputs, self.dropout, train=self.training)
-        feature = self.predictor(feature)
+        classifier_logits = self._classifier_logits(fused_outputs)
+        feature = classifier_logits
+        prototype_logits = None
         if self.args.use_nearest_neighbour:
             anchors = self.get_mapped_anchors()
             self.last_emo_anchor = anchors
@@ -347,14 +369,20 @@ class CLModel(nn.Module):
                 mask_mapped_outputs.unsqueeze(1).unsqueeze(2),
                 anchors.unsqueeze(0)
             )
-            anchor_scores = self.aggregate_subanchors(subanchor_scores)
+            prototype_logits = self.aggregate_subanchors(subanchor_scores)
+            anchor_scores = prototype_logits
             if self.args.prototype_pooling == "entropy":
-                feature = anchor_scores
+                feature = prototype_logits
+            if self.use_classifier_prototype_fusion:
+                feature = self._fuse_logits(classifier_logits, prototype_logits)
+                anchor_scores = feature
             
         else:
             anchor_scores = None
         self.last_forward_output.update({
             "logits": feature,
+            "classifier_logits": classifier_logits,
+            "prototype_logits": prototype_logits,
             "mask_mapped_outputs": mask_mapped_outputs,
             "raw_outputs": mask_outputs,
             "anchor_scores": anchor_scores,

@@ -82,11 +82,13 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
         component_losses["gate_entropy"].append(loss_output.gate_entropy.item())
 
         if train:
-            loss.backward()
+            accumulation_step = max(1, int(getattr(args, "accumulation_step", 1)))
+            (loss / accumulation_step).backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2)
             if not torch.isfinite(grad_norm):
                 raise ValueError(f"Non-finite gradient norm at epoch={epoch + 1}, batch={batch_id}: {grad_norm}")
-            if batch_id % args.accumulation_step == 0:
+            should_step = ((batch_id + 1) % accumulation_step == 0) or ((batch_id + 1) == len(dataloader))
+            if should_step:
                 optimizer.step()
                 if lr_scheduler is not None and getattr(args, "lr_scheduler", "step") != "step":
                     lr_scheduler.step()
