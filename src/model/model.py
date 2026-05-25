@@ -52,6 +52,28 @@ class CLModel(nn.Module):
         anchor_tensor = load_anchor_tensor(args.anchor_path, args.dataset_name, args.num_subanchors).float()
         self.register_buffer("emo_anchor", anchor_tensor.to(self.device))
         self.num_subanchors = self.emo_anchor.shape[1]
+        self.cluster_anchors = None
+        if getattr(args, "use_cluster_anchors", False):
+            obj = torch.load(args.cluster_anchor_path, map_location="cpu")
+            cluster_anchors = obj["anchors"] if isinstance(obj, dict) else obj
+            if cluster_anchors.dim() != 3:
+                raise ValueError("cluster anchors must have shape [num_classes, num_subanchors, mapping_dim]")
+            if cluster_anchors.shape[0] != self.num_classes:
+                raise ValueError(
+                    f"cluster anchor class count {cluster_anchors.shape[0]} does not match {self.num_classes}"
+                )
+            if cluster_anchors.shape[1] != self.num_subanchors:
+                raise ValueError(
+                    f"cluster anchor count {cluster_anchors.shape[1]} does not match --num_subanchors {self.num_subanchors}"
+                )
+            if cluster_anchors.shape[2] != args.mapping_lower_dim:
+                raise ValueError(
+                    f"cluster anchor dim {cluster_anchors.shape[2]} does not match --mapping_lower_dim {args.mapping_lower_dim}"
+                )
+            self.cluster_anchors = nn.Parameter(
+                cluster_anchors.float(),
+                requires_grad=not getattr(args, "freeze_cluster_anchors", False),
+            )
         self.register_buffer(
             "emo_label",
             torch.arange(self.num_classes, dtype=torch.long).repeat_interleave(self.num_subanchors).to(self.device)
@@ -85,6 +107,11 @@ class CLModel(nn.Module):
         flat_anchor = self.emo_anchor.view(-1, self.dim)
         mapped = self.map_function(flat_anchor)
         return mapped.view(self.num_classes, self.num_subanchors, -1)
+
+    def get_active_mapped_anchors(self):
+        if self.cluster_anchors is not None:
+            return F.normalize(self.cluster_anchors, dim=-1)
+        return F.normalize(self.get_mapped_anchors(), dim=-1)
 
     def get_domain_mapped_anchors(self):
         domain_anchors = []
@@ -161,7 +188,7 @@ class CLModel(nn.Module):
         feature = torch.dropout(mask_outputs, self.dropout, train=self.training)
         feature = self.predictor(feature)
         if self.args.use_nearest_neighbour:
-            anchors = self.get_mapped_anchors()
+            anchors = self.get_active_mapped_anchors()
             self.last_emo_anchor = anchors
             subanchor_scores = self.score_func(
                 mask_mapped_outputs.unsqueeze(1).unsqueeze(2),

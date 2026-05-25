@@ -169,6 +169,22 @@ def get_parser():
     parser.add_argument("--prototype_pooling", type=str, default="max", choices=["max", "logsumexp", "entropy", "domain_gated"])
     parser.add_argument("--domain_entropy_eps", type=float, default=1e-6)
     parser.add_argument("--disable_anchor_updates", action="store_true")
+    parser.add_argument("--use_cluster_anchors", action="store_true",
+                        help="Use cluster-initialized mapped-space sub-anchors.")
+    parser.add_argument("--cluster_anchor_path", type=str, default=None,
+                        help="Path to cluster anchors saved by generate_cluster_anchors.py.")
+    parser.add_argument("--anchor_pull_weight", type=float, default=0.0,
+                        help="Weight for sample-to-subanchor compactness loss.")
+    parser.add_argument("--hyp_inter_weight", type=float, default=0.0,
+                        help="Weight for hyperspherical inter-class sub-anchor separation loss.")
+    parser.add_argument("--intra_div_weight", type=float, default=0.0,
+                        help="Weight for optional intra-class sub-anchor diversity loss.")
+    parser.add_argument("--intra_same_upper", type=float, default=0.85,
+                        help="Upper cosine similarity threshold for same-class sub-anchor diversity loss.")
+    parser.add_argument("--freeze_cluster_anchors", action="store_true",
+                        help="Freeze cluster anchors during stage-1 training.")
+    parser.add_argument("--warmup_anchor_update_epochs", type=int, default=0,
+                        help="Freeze template-anchor EMA update for first N epochs.")
     parser.add_argument("--early_stop_patience", type=int, default=0,
                         help="Stop stage 1 if the selected metric does not improve for N epochs. 0 disables early stopping.")
     parser.add_argument("--early_stop_metric", type=str, default="test", choices=["valid", "test"],
@@ -187,6 +203,11 @@ def get_parser():
 
 if __name__ == '__main__':
     args = get_parser()
+    if args.use_cluster_anchors:
+        if not args.cluster_anchor_path:
+            raise ValueError("--use_cluster_anchors requires --cluster_anchor_path")
+        if args.prototype_pooling not in ["max", "logsumexp"]:
+            raise NotImplementedError("cluster anchors currently support --prototype_pooling max/logsumexp only")
     if args.prototype_pooling in ["entropy", "domain_gated"] and args.num_subanchors != len(DOMAIN_NAMES):
         raise ValueError(
             f"--prototype_pooling {args.prototype_pooling} expects "
@@ -274,17 +295,26 @@ if __name__ == '__main__':
         
         train_loss, train_acc, _, _, train_fscore, train_detail_f1, max_cosine  = \
             train_or_eval_model(model, loss_function, train_loader, e, device, args, optimizer, lr_scheduler, True)
+        train_loss_stats = getattr(model, "last_epoch_loss_stats", {})
+        train_assignment_counts = getattr(model, "last_epoch_assignment_counts", None)
         if args.lr_scheduler == "step":
             lr_scheduler.step()
         valid_loss, valid_acc, _, _, valid_fscore, valid_detail_f1, _ = \
             train_or_eval_model(model, loss_function, valid_loader, e, device, args)
+        valid_loss_stats = getattr(model, "last_epoch_loss_stats", {})
         test_loss, test_acc, test_label, test_pred, test_fscore, test_detail_f1, _ = \
             train_or_eval_model(model, loss_function, test_loader, e, device, args)
+        test_loss_stats = getattr(model, "last_epoch_loss_stats", {})
         all_fscore.append([valid_fscore, test_fscore, test_detail_f1])
 
         logger.info( 'Epoch: {}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'. \
             format(e + 1, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc,
             test_fscore, round(time.time() - start_time, 2)))
+        logger.info("Train loss/detail stats: {}".format(train_loss_stats))
+        logger.info("Valid loss/detail stats: {}".format(valid_loss_stats))
+        logger.info("Test loss/detail stats: {}".format(test_loss_stats))
+        if args.use_cluster_anchors:
+            logger.info("Cluster subanchor assignment counts: {}".format(train_assignment_counts))
 
         if valid_fscore > best_valid_fscore:
             best_valid_fscore = valid_fscore
@@ -341,7 +371,7 @@ if __name__ == '__main__':
         with torch.no_grad():
             model.load_state_dict(torch.load(path + args.dataset_name + '/model_' + '.pkl'))
             model.eval()
-            anchors = model.get_mapped_anchors()
+            anchors = model.get_active_mapped_anchors()
             emb_train, emb_val, emb_test = [] ,[] ,[]
             label_train, label_val, label_test = [], [], []
             for batch_id, batch in enumerate(train_loader):
