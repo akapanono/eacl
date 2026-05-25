@@ -1,820 +1,641 @@
 # ERC 当前模型结构报告
 
-## 1. 总览
+生成时间：2026-05-25  
+当前代码版本：`a395917 回退` + 当前工作区域锚点更新  
+当前状态：已回退到“大改动之前 / 改进1”附近的 EACL 结构，并重新设计了 emotion anchor 的域划分与标准锚点。
 
-当前项目是在原始 EACL 框架上继续扩展的 ERC 模型。它的核心思想是：
+## 1. 总体结论
 
-1. 用预训练语言模型编码对话上下文中的目标话语；
-2. 用情感语义 anchor / prototype 作为类别先验；
-3. 通过 supervised contrastive learning、anchor separation、hard negative 等辅助目标改善表示空间；
-4. 通过 neutral decoupling 单独处理 neutral 类别；
-5. 通过 speaker state 与 domain-gated subanchors 引入更细粒度的情感域信息；
-6. 最新加入 classifier head + prototype head fusion，用数据驱动分类头和语义原型头共同预测。
+当前项目主体是 **Emotion-Anchored Contrastive Learning, EACL**。模型不是复杂的多模块融合结构，而是一个相对清晰的两阶段框架：
 
-当前主要入口文件：
+1. **阶段一：PLM 表征学习 + 情绪锚点对比学习**
+   - 用预训练语言模型编码带上下文的对话轮次。
+   - 取 prompt 中 `<mask>` 位置的 hidden state 作为当前 utterance 表征。
+   - 一条分支经过线性分类头输出 emotion logits。
+   - 另一条分支映射到 anchor/prototype 空间，与情绪锚点做 supervised contrastive learning。
 
-| 模块 | 文件 | 作用 |
-|---|---|---|
-| 训练入口 | `src/run.py` | 参数解析、数据集加载、训练循环、保存模型和报告 |
-| 数据集 | `src/dataset.py` | 将对话样本构造成 prompt 输入 |
-| 主模型 | `src/model/model.py` | PLM 编码、anchor 映射、domain gate、neutral branch、fusion |
-| 损失函数 | `src/model/loss.py` | CE、SupCon、Angle、SAS、Hard Negative、Gate Entropy |
-| 训练器 | `src/trainer/trainer.py` | train/eval loop、梯度裁剪、梯度累积、指标统计 |
-| anchor 模板 | `src/model/anchor_utils.py` | emotion label 顺序、anchor prompt、anchor 加载 |
-| 后台实验队列 | `scripts/sas_nsg_train_queue.py` | 统一运行 baseline、ablation、targeted、fusion 实验组 |
+2. **阶段二：Emotion Anchor Adaptation**
+   - 阶段一结束后，提取 train/dev/test 的 mapped utterance embeddings。
+   - 使用训练好的 emotion anchors 初始化一个轻量 `Classifier`。
+   - 单独训练该 prototype classifier，进一步提升 anchor 的分类能力。
 
-## 2. 输入数据流
+当前版本没有启用之前大改动中的 speaker memory、adaptive fusion、neutral-aware SupCon、hard negative、SAS/NSG 队列脚本等结构。
 
-### 2.1 支持的数据集
+## 2. 数据输入与 Prompt 构造
 
-当前 `src/run.py` 中原生支持：
+相关文件：
 
-| 数据集 | 文件格式 | 类别数 |
-|---|---:|---:|
-| IEMOCAP | `train/dev/test_data.json` | 6 |
-| MELD | `train/dev/test_data.csv` | 7 |
-| EmoryNLP | `train/dev/test_data.json` | 7 |
+- `src/dataset.py`
+- `src/utils/data_process.py`
 
-数据目录约定：
+支持数据集：
 
-```text
-data/{dataset_name}/train_data.*
-data/{dataset_name}/dev_data.*
-data/{dataset_name}/test_data.*
-data/{dataset_name}/label_vocab.pkl
+- `IEMOCAP`：6 类
+- `MELD`：7 类
+- `EmoryNLP`：7 类
+
+每个样本对应一个目标 utterance。数据处理逻辑如下：
+
+1. 读取对话。
+2. 对每轮构造：
+
+   ```text
+   speaker says: utterance_text
+   ```
+
+3. 对目标轮次之前的上下文进行截断拼接，最多受 `max_len` 和过去窗口约束。
+4. 对目标 utterance 构造 prompt：
+
+   ```text
+   For utterance: {text} {speaker} feels <mask>
+   ```
+
+5. 最终输入是：
+
+   ```text
+   [历史上下文] + For utterance: ... feels <mask>
+   ```
+
+6. `DialogueDataset.__getitem__()` 返回：
+
+   ```python
+   input_ids, label
+   ```
+
+当前版本没有 speaker state / speaker memory 额外输入。
+
+## 3. 主模型 CLModel
+
+相关文件：
+
+- `src/model/model.py`
+
+核心类：
+
+```python
+class CLModel(nn.Module)
 ```
 
-### 2.2 话语 prompt 构造
+### 3.1 PLM 编码器
 
-`DialogueDataset` 会按对话顺序读取每个 turn，并构造目标话语 prompt：
-
-```text
-历史上下文 + "For utterance: {text} {speaker} feels <mask>"
-```
-
-其中：
-
-- 历史上下文来自当前话语之前的若干 turn；
-- `max_len` 默认 256；
-- 当前话语情感由 `<mask>` 位置的表示参与后续分类；
-- 如果开启 `--use_speaker_state`，每条样本额外返回 speaker state 文本及 attention mask。
-
-### 2.3 speaker state
-
-speaker state 的默认字段为：
-
-```text
-mental_state
-interaction_relation
-expression_style
-context_shift
-```
-
-如果原始数据没有这些字段，则统一使用 `unknown.`。这保证了开启 speaker state 后，模型不会因为缺字段而中断。
-
-## 3. 编码器结构
-
-主编码器是 HuggingFace `AutoModel`：
+模型使用 HuggingFace `AutoModel`：
 
 ```python
 self.f_context_encoder = AutoModel.from_pretrained(args.bert_path, local_files_only=True)
 ```
 
-典型配置使用：
+默认运行脚本中使用：
 
-```text
-pretrained/sup-simcse-roberta-large
+```bash
+./pretrained/sup-simcse-roberta-large
 ```
 
-输入经过 PLM 后，模型取 `<mask>` 位置 hidden state：
+编码后取 `<mask>` 位置 hidden state：
 
-```text
-mask_outputs = PLM(input_ids)[mask_position]
+```python
+mask_outputs = utterance_encoded[batch_index, mask_pos]
 ```
 
-记作：
+这个 `mask_outputs` 是当前 utterance 的主语义表征，维度通常为 1024。
 
-```text
-h_i in R^d
+### 3.2 分类头
+
+分类头很轻：
+
+```python
+self.predictor = nn.Sequential(
+    nn.Linear(self.dim, self.num_classes)
+)
 ```
 
-其中 `d` 通常为 1024。
-
-## 4. 情感 Anchor / Prototype
-
-### 4.1 anchor 文件
-
-anchor 由 `src/generate_anchors.py` 生成，保存到：
+流程：
 
 ```text
-emo_anchors/{model_name}/{dataset_name_lower}_emo_{num_subanchors}.pt
+mask_outputs
+  -> dropout
+  -> Linear(dim, num_classes)
+  -> logits
 ```
 
-例如：
+如果不使用 nearest-neighbour prototype 推理，最终预测来自这个分类头。
 
-```text
-emo_anchors/sup-simcse-roberta-large/iemocap_emo_4.pt
+### 3.3 Anchor 映射层
+
+模型还有一个映射函数，把 PLM 表征映射到 prototype/anchor 空间：
+
+```python
+self.map_function = nn.Sequential(
+    nn.Linear(self.dim, self.dim),
+    nn.LayerNorm(self.dim),
+    nn.ReLU(),
+    nn.Linear(self.dim, args.mapping_lower_dim),
+)
 ```
 
-### 4.2 anchor 张量形状
+用途：
 
-当前模型按多子锚点设计：
+- 将 utterance 表征映射成 `mask_mapped_outputs`
+- 将 emotion anchors 映射到同一空间
+- 用于 supervised contrastive loss
+- 用于 nearest-neighbour prototype 分类
 
-```text
-emo_anchor: [num_classes, num_subanchors, hidden_dim]
+## 4. Emotion Anchors / Prototypes
+
+相关文件：
+
+- `src/generate_anchors.py`
+- `src/model/anchor_utils.py`
+- `src/model/model.py`
+
+### 4.1 Anchor 生成
+
+运行入口：
+
+```bash
+python src/generate_anchors.py --bert_path <model_path> --num_subanchors <N>
 ```
 
-在 `domain_gated` 或 `entropy` 模式下，要求：
+每个 emotion 会有若干自然语言模板，例如：
 
 ```text
-num_subanchors = 4
+The speaker feels angry and tense.
+The speaker feels sad and down.
 ```
 
-4 个 subanchors 对应四个情感域：
+这些模板经过同一个 PLM 编码，得到 emotion anchor。
+
+保存格式：
 
 ```text
-activation
-interaction
-expression
-context_shift
+emo_anchors/{model_name}/{dataset_name}_emo_{num_subanchors}.pt
+emo_anchors/{model_name}/{dataset_name}_emo.pt
 ```
 
-### 4.3 标签顺序
+其中：
 
-`anchor_utils.py` 中定义了 anchor 的类别顺序。这个顺序必须和 `label_vocab.pkl` 的 id 顺序一致，否则 prototype 语义会错位。
+- `{dataset_name}_emo_{num_subanchors}.pt` 保存多域 sub-anchor。
+- `{dataset_name}_emo.pt` 保存标准锚点。
 
-IEMOCAP：
+当前标准锚点不再由多个域锚点简单平均得到，而是由独立的 canonical emotion descriptions 生成。这样标准锚点更接近类别中心，域锚点则负责表达情绪在不同维度上的变化。
+
+### 4.2 Anchor Tensor 形状
+
+加载后统一为：
 
 ```text
-neutral, excited, frustrated, sad, happy, angry
+[num_classes, num_subanchors, hidden_dim]
 ```
 
-MELD：
+例如 IEMOCAP、`num_subanchors=5`：
 
 ```text
-anger, disgust, fear, joy, sadness, surprise, neutral
+[6, 5, 1024]
 ```
 
-EmoryNLP：
+### 4.3 Sub-anchor 聚合
 
-```text
-joyful, neutral, powerful, mad, scared, peaceful, sad
+当前支持：
+
+```bash
+--prototype_pooling max
+--prototype_pooling logsumexp
+--prototype_pooling entropy
+--prototype_pooling domain_gated
 ```
 
-## 5. 表示映射模块
+默认是：
 
-模型有两类表示映射。
+```bash
+--prototype_pooling max
+```
 
-### 5.1 通用映射 `map_function`
+不同模式含义：
 
-用于普通 prototype matching：
+- `max`：每类多个 sub-anchor 取最大相似度。
+- `logsumexp`：对多个 sub-anchor 做平滑聚合。
+- `entropy`：根据 sub-anchor/domain 分布熵计算权重。
+- `domain_gated`：使用 `domain_gate` 学习不同 domain/sub-anchor 的权重。
+
+注意：`entropy` 和 `domain_gated` 要求：
+
+```bash
+--num_subanchors 5
+```
+
+当前 5 个域为：
 
 ```text
-Linear(d, d)
-LayerNorm
-ReLU
-Linear(d, mapping_lower_dim)
+valence
+arousal
+dominance_control
+social_appraisal
+discourse_context
+```
+
+并且默认会关闭第二阶段训练，除非显式加：
+
+```bash
+--force_two_stage
+```
+
+## 5. Domain-aware 组件
+
+当前代码保留了较早版本中的 domain-aware prototype 支持，但不是默认主路径。
+
+相关结构：
+
+```python
+self.domain_adapters
+self.domain_gate
+```
+
+`domain_adapters` 为每个 sub-anchor/domain 准备一个映射器。当前每个 emotion 有 5 个 domain anchors，分别对应 valence、arousal、dominance/control、social appraisal 和 discourse context。  
+`domain_gate` 根据当前 utterance 表征生成 domain 权重。
+
+当：
+
+```bash
+--prototype_pooling domain_gated
+```
+
+时，模型走 `domain_gated_scores()` 分支。
+
+否则主流程仍是普通：
+
+```text
+mask_outputs -> map_function -> anchor similarity
+```
+
+## 6. Forward 输出
+
+`CLModel.forward(sentences, return_mask_output=True)` 返回：
+
+```python
+feature, mask_mapped_outputs, mask_outputs, anchor_scores
+```
+
+含义：
+
+- `feature`
+  - 默认是分类头 logits。
+  - 若 `prototype_pooling == entropy` 且启用 nearest-neighbour，则可能替换为 anchor scores。
+
+- `mask_mapped_outputs`
+  - utterance 在 anchor 空间中的表示。
+  - 用于 SupCon loss 和二阶段缓存。
+
+- `mask_outputs`
+  - PLM 原始 `<mask>` hidden state。
+  - 用于动态更新 anchors。
+
+- `anchor_scores`
+  - utterance 与 emotion anchors 的相似度分数。
+  - 只有 `--use_nearest_neighbour` 时用于预测。
+
+## 7. Loss 结构
+
+相关文件：
+
+- `src/model/loss.py`
+- `src/trainer/trainer.py`
+
+总损失在 trainer 中组合：
+
+```python
+loss = ce_loss * ce_loss_weight + (1 - ce_loss_weight) * cl_loss
 ```
 
 默认：
 
-```text
-mapping_lower_dim = 1024
+```bash
+--ce_loss_weight 0.1
 ```
 
-### 5.2 domain adapters
-
-用于 domain-specific subanchors：
+也就是：
 
 ```text
-domain_adapters[k], k = 1..num_subanchors
+0.1 * CrossEntropy + 0.9 * ContrastiveLoss
 ```
 
-每个 adapter 结构为：
+### 7.1 Cross Entropy
 
-```text
-Linear(d, d)
-LayerNorm
-ReLU
-Dropout
-Linear(d, mapping_lower_dim)
+分类头输出 logits，与真实 emotion label 做 CE：
+
+```python
+nn.CrossEntropyLoss(ignore_index=-1)
 ```
 
-在 `domain_gated` 下，不同情感域使用不同 adapter 映射 utterance 与 anchor。
-
-## 6. Speaker State Fusion
-
-如果开启：
+可选类别均衡：
 
 ```bash
---use_speaker_state
+--class_balanced_ce
 ```
 
-模型会复用同一个 PLM 编码 speaker state 文本，得到：
+启用后根据训练集标签频率设置 class weights。
+
+### 7.2 SupConLoss
+
+对比学习输入包括：
 
 ```text
-r_i in R^d
+utterance mapped representations
+emotion anchors
 ```
 
-然后使用门控融合：
-
-```text
-e_i = Linear(r_i)
-alpha_i = Sigmoid(MLP([h_i, e_i]))
-u_i = LayerNorm(h_i + alpha_i * e_i)
-```
-
-其中：
-
-- `h_i` 是原始 `<mask>` 表示；
-- `r_i` 是 speaker state 表示；
-- `u_i` 是融合后的 utterance 表示。
-
-如果关闭 speaker state，则：
-
-```text
-u_i = h_i
-```
-
-## 7. Neutral Decoupling
-
-如果开启：
+如果没有禁用 anchors：
 
 ```bash
---use_neutral_decoupling
+--disable_emo_anchor
 ```
 
-模型将 ERC 分类拆成两步：
+则会把 utterance representations 和 flattened anchors 拼接：
 
-1. neutral vs non-neutral；
-2. non-neutral 内部情感分类。
+```python
+concated_reps = torch.cat([reps, flat_anchor], dim=0)
+concated_labels = torch.cat([labels, anchor_labels], dim=0)
+```
 
-### 7.1 neutral branch
+正样本：
 
 ```text
-neutral_logit = NeutralClassifier(u_i)
-neutral_prob = sigmoid(neutral_logit)
+label 相同的 utterance / anchor
 ```
 
-`NeutralClassifier` 结构：
+负样本：
 
 ```text
-Dropout
-Linear(d, d)
-ReLU
-Dropout
-Linear(d, 1)
+label 不同的 utterance / anchor
 ```
 
-### 7.2 non-neutral branch
+相似度函数：
 
-如果数据集包含 neutral，模型会构建：
-
-```text
-non_neutral_to_original
-original_to_non_neutral
+```python
+(1 + cosine_similarity(x, y)) / 2 + eps
 ```
 
-non-neutral prototype logits 只覆盖非 neutral 类别。
+### 7.3 AngleLoss
 
-最终概率重建为：
+为了让不同类的 class anchors 在空间里更分离，SupConLoss 中还加入了 anchor center 的角度损失：
 
-```text
-P(neutral) = neutral_prob
-P(non-neutral class c) = (1 - neutral_prob) * softmax(non_neutral_logits)[c]
+```python
+loss += args.angle_loss_weight * angleloss
 ```
 
-这避免了直接对 `final_probs` 做不稳定的 `log(0)`。
-
-## 8. Prototype Head
-
-prototype head 通过 utterance 表示与 anchor 表示的 cosine similarity 进行分类。
-
-基础相似度：
-
-```text
-score(x, y) = (1 + cosine(x, y)) / 2 + eps
-```
-
-### 8.1 max pooling
-
-对同一类别的多个 subanchors 取最大值：
-
-```text
-logit_c = max_k score(u_i, anchor_{c,k})
-```
-
-### 8.2 logsumexp pooling
-
-平滑聚合多个 subanchors：
-
-```text
-logit_c = logsumexp(score_{c,k} / temp)
-```
-
-### 8.3 entropy pooling
-
-根据 subanchor 分布熵计算权重：
-
-```text
-domain_probs = softmax(score / temp)
-entropy = -sum(p log p)
-domain_weight = normalize(1 / (entropy + eps))
-```
-
-### 8.4 domain_gated pooling
-
-这是当前重点结构。
-
-对每个 domain adapter：
-
-```text
-domain_feature_k = adapter_k(u_i)
-domain_anchor_{c,k} = adapter_k(anchor_{c,k})
-domain_score_{k,c} = score(domain_feature_k, domain_anchor_{c,k})
-```
-
-再用 domain gate 得到每个样本的 domain 权重：
-
-```text
-gate_input = [u_i, optional speaker_state, optional neutral_prob]
-domain_weights = softmax(MLP(gate_input))
-```
-
-最终 prototype 概率：
-
-```text
-P_proto(c) = sum_k domain_weights_k * softmax(domain_score_k)[c]
-prototype_logits = log(P_proto + eps)
-```
-
-## 9. Classifier Head
-
-模型保留了一个普通线性分类头：
-
-```text
-classifier_logits = Linear(Dropout(u_i))
-```
-
-输出维度为完整类别数：
-
-```text
-[batch_size, num_classes]
-```
-
-如果启用 neutral decoupling，则 fusion 时只取 non-neutral 部分：
-
-```text
-non_neutral_classifier_logits = classifier_logits[:, non_neutral_to_original]
-```
-
-## 10. Classifier-Prototype Fusion
-
-最新新增模块由两个参数控制：
+默认：
 
 ```bash
---use_classifier_prototype_fusion
---fusion_alpha 0.5
+--angle_loss_weight 1.0
 ```
 
-融合公式：
-
-```text
-final_logits = alpha * classifier_logits + (1 - alpha) * prototype_logits
-```
-
-其中：
-
-| alpha | 含义 |
-|---:|---|
-| 0.3 | 更依赖 prototype head |
-| 0.5 | classifier 与 prototype 均衡 |
-| 0.7 | 更依赖 classifier head |
-
-### 10.1 无 neutral decoupling 时
-
-两者 shape 都是：
-
-```text
-[batch_size, num_classes]
-```
-
-直接融合。
-
-### 10.2 有 neutral decoupling 时
-
-融合只发生在 non-neutral 分支：
-
-```text
-final_non_neutral_logits =
-  alpha * non_neutral_classifier_logits
-  + (1 - alpha) * prototype_non_neutral_logits
-```
-
-然后再和 neutral branch 重组最终分布。
-
-## 11. Anchor 动量更新
-
-训练时模型会根据 batch 中的样本表示更新 anchor：
-
-```text
-new_anchor = momentum * old_anchor + (1 - momentum) * batch_centroid
-```
-
-当前稳定性保护：
-
-1. `--freeze_prototype_epochs` 控制前若干 epoch 不更新；
-2. `@torch.no_grad()` 下更新；
-3. `--normalize_prototypes_after_update` 更新后归一化；
-4. neutral decoupling 下跳过 neutral 类别；
-5. 空 batch 或无对应类别样本时直接跳过。
-
-推荐稳定配置：
+运行脚本 `run.sh` 中设置为：
 
 ```bash
---prototype_momentum 0.995
---freeze_prototype_epochs 3
---normalize_prototypes_after_update
+ang_weight=0.1
 ```
 
-## 12. Loss 结构
+## 8. Anchor 动态更新
 
-当前 loss 由主任务和多个辅助项组成。
-
-### 12.1 无增强模块时
-
-如果未开启 SAS-NSG 相关模块，使用原始 EACL 风格：
-
-```text
-L_total = ce_loss_weight * L_CE + (1 - ce_loss_weight) * L_CL
-```
-
-其中：
-
-```text
-L_CL = L_SupCon + angle_loss_weight * L_Angle
-```
-
-### 12.2 开启增强模块时
-
-如果开启以下任一模块：
-
-```text
-neutral decoupling
-speaker state
-similar anchor separation
-hard anchor negative
-```
-
-则使用增强版 loss：
-
-```text
-L_task = L_CE + lambda_neu * L_neutral
-
-L_total =
-  L_task
-  + lambda_supcon * L_SupCon
-  + lambda_angle * L_Angle
-  + lambda_sas * L_SAS
-  + lambda_hard * L_Hard
-  - lambda_gate_entropy * H_gate
-```
-
-### 12.3 Neutral Loss
-
-neutral branch 使用稳定形式：
-
-```text
-L_neutral = BCEWithLogits(neutral_logit, is_neutral)
-```
-
-non-neutral 分类使用：
-
-```text
-L_CE = CrossEntropy(non_neutral_logits, mapped_non_neutral_label)
-```
-
-### 12.4 SupCon Loss
-
-SupCon 使用 utterance representation 与 anchor representation 拼接后做监督对比学习。
-
-neutral decoupling 开启时，SupCon 只在 non-neutral 样本上计算。
-
-空 batch 或没有正样本时返回 0，避免 NaN。
-
-### 12.5 Angle Loss
-
-Angle Loss 作用于类别中心 anchor，目标是拉开类别中心方向。
-
-```text
-class_anchor = mean_k(anchor_{c,k})
-```
-
-### 12.6 Similar Anchor Separation Loss
-
-如果开启：
+阶段一训练时，如果没有设置：
 
 ```bash
---use_similar_anchor_separation
+--disable_anchor_updates
 ```
 
-对指定相似情感对施加 margin：
+则每个 batch 后会调用：
 
-```text
-L_SAS = mean ReLU(cos(anchor_a, anchor_b) - margin)^2
+```python
+model.update_anchors(raw_reps, label)
 ```
 
-默认相似对：
+更新逻辑：
 
-```text
-happy:excited
-sad:frustrated
-angry:frustrated
+1. 取当前 batch 的 raw `<mask>` outputs。
+2. 通过 `map_function` 映射。
+3. 对每个类别，找该类别样本最接近的 sub-anchor。
+4. 用 momentum 更新原始 anchor：
+
+```python
+anchor = momentum * anchor + (1 - momentum) * class_centroid
 ```
 
-### 12.7 Hard Anchor Negative Loss
-
-如果开启：
+默认：
 
 ```bash
---use_hard_anchor_negative
+--prototype_momentum 0.9
 ```
 
-对相似但不同类的 anchor 增加负样本权重：
+## 9. 训练流程
+
+相关文件：
+
+- `src/run.py`
+- `src/trainer/trainer.py`
+- `run.sh`
+
+### 9.1 阶段一
+
+每个 epoch：
+
+1. train
+2. dev
+3. test
+4. 记录 weighted F1
+5. 保存 best checkpoint
+
+保存路径：
 
 ```text
-weighted_logits = logits + log(weight)
-L_Hard = logsumexp(weighted_logits) - positive_logit
+saved_models/{dataset_name}/model_.pkl
 ```
 
-当前实现使用 `logsumexp`、logits clamp、空 batch 跳过，避免指数爆炸。
-
-### 12.8 Gate Entropy
-
-domain gate 的熵作为正则项：
-
-```text
-H_gate = -sum_k w_k log(w_k)
-```
-
-总 loss 中使用：
-
-```text
-- lambda_gate_entropy * H_gate
-```
-
-这鼓励 domain gate 不要过早塌缩到单一 domain。
-
-## 13. 训练流程
-
-训练入口：
+早停可选：
 
 ```bash
-python src/run.py ...
+--early_stop_patience
+--early_stop_metric valid|test
 ```
 
-核心流程：
+### 9.2 阶段二
 
-1. 解析命令行参数；
-2. 加载 tokenizer 与数据集；
-3. 构造 `DialogueDataset` 和 DataLoader；
-4. 创建 `CLModel`；
-5. 计算可选 class-balanced CE 权重；
-6. 使用 AdamW 优化器；
-7. 支持 StepLR 或 cosine scheduler；
-8. 每个 epoch 依次 train、valid、test；
-9. 根据 `--save_best_metric` 保存最佳 checkpoint；
-10. 输出 `confusion_matrix.csv` 与 `similar_pair_confusion.csv`；
-11. 如果未禁用 two-stage，再训练第二阶段 classifier。
-
-当前 SAS-NSG / domain-aware 配置默认会禁用 two-stage：
-
-```text
-prototype_pooling in ["entropy", "domain_gated"]
-或开启 SAS-NSG 模块
-且未指定 --force_two_stage
-=> disable_two_stage_training = True
-```
-
-## 14. 稳定性设计
-
-当前模型已经加入多处 NaN 防护：
-
-| 位置 | 防护 |
-|---|---|
-| loss | `check_finite_loss` |
-| trainer | loss finite 检查 |
-| gradient | `clip_grad_norm_` |
-| debug | `--debug_finite_checks` 检查参数和 buffer |
-| neutral | BCEWithLogits + CE，避免 `log(0)` |
-| hard negative | `logsumexp` + clamp |
-| SAS | normalize + clamp |
-| prototype update | freeze + no_grad + normalize |
-| empty batch | 多处直接返回 0 loss |
-
-## 15. 指标与报告输出
-
-每个 run 会记录：
-
-```text
-logging.log
-model_.pkl
-confusion_matrix.csv
-similar_pair_confusion.csv
-```
-
-训练日志包含：
-
-```text
-train_loss / train_acc / train_fscore
-valid_loss / valid_acc / valid_fscore
-test_loss / test_acc / test_fscore
-loss component stats
-neutral_f1
-non_neutral_macro_f1
-avg_domain_weight
-```
-
-`similar_pair_confusion.csv` 用于观察相似情感混淆：
-
-```text
-left_to_right
-right_to_left
-total
-rate
-```
-
-## 16. 后台实验队列
-
-后台实验入口：
+如果没有设置：
 
 ```bash
-bash scripts/run_sas_nsg_background.sh
+--disable_two_stage_training
 ```
 
-或直接运行：
+则进入第二阶段：
+
+1. 加载阶段一 best model。
+2. 提取 train/dev/test 的 mapped embeddings。
+3. 构造 `Classifier(args, anchors)`。
+4. 用 anchors 作为可训练参数进行 10 epoch 分类器训练。
+
+二阶段分类器本质是：
+
+```python
+class Classifier(nn.Module):
+    self.weight = nn.Parameter(anchors)
+```
+
+预测时计算输入 embedding 和每个 anchor 的 cosine similarity，再按 sub-anchor 聚合。
+
+## 10. 当前默认运行方式
+
+当前 `run.sh`：
 
 ```bash
-python scripts/sas_nsg_train_queue.py --dataset IEMOCAP --gpu-id 0 --epochs 30 --experiment-set all
+bash run.sh IEMOCAP ./pretrained/sup-simcse-roberta-large
 ```
 
-### 16.1 实验集合
+脚本内部关键参数：
 
-| experiment-set | 内容 | 数量 |
-|---|---|---:|
-| `all` | baseline + A1-A8 + R1-R10 + F1-F3 | 22 |
-| `ablation` | baseline + A1-A8 | 9 |
-| `targeted` | baseline + R1-R10 | 11 |
-| `fusion` | baseline + F1-F3 | 4 |
-
-### 16.2 默认 baseline
-
-当前 baseline 对应计划中的 trial004：
-
-```yaml
-seed: 4668
-lr: 5e-5
-ptmlr: 5e-6
-dropout: 0.25
-batch_size: 8
-temp: 0.3
-prototype_pooling: domain_gated
-prototype_momentum: 0.995
-max_grad_norm: 0.5
-freeze_prototype_epochs: 3
-ce_loss_weight: 0.4
-lambda_neu: 0.2
-lambda_supcon: 0.2
-lambda_angle: 0.01
-lambda_sas: 0.002
-lambda_hard: 0.005
-lambda_gate_entropy: 0.001
-sas_margin: 0.30
-hard_negative_rho: 0.5
-hard_negative_temperature: 0.2
+```bash
+ce_loss_weight=0.1
+tmp=0.1
+ang_weight=0.1
+stage_two_lr=1e-4
+seed=1
+num_subanchors=5
 ```
 
-### 16.3 输出目录
+实际运行会先生成 anchors：
 
-后台队列会创建统一目录：
+```bash
+python src/generate_anchors.py --bert_path $model_path --num_subanchors 5
+```
+
+然后后台启动训练：
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python src/run.py \
+  --anchor_path "./emo_anchors/${dir_name}" \
+  --bert_path $model_path \
+  --dataset_name $dataset \
+  --ce_loss_weight 0.1 \
+  --temp 0.1 \
+  --seed 1 \
+  --angle_loss_weight 0.1 \
+  --stage_two_lr 1e-4 \
+  --num_subanchors 5 \
+  --disable_training_progress_bar \
+  --use_nearest_neighbour
+```
+
+## 11. 当前仍保留的主要开关
+
+### 模型与训练
+
+| 参数 | 作用 | 默认 |
+|---|---|---|
+| `--bert_path` | PLM 路径 | `./pretrained/sup-simcse-roberta-large` |
+| `--dataset_name` | 数据集 | `IEMOCAP` |
+| `--epochs` | 阶段一 epoch 数 | `8` |
+| `--batch_size` | batch size | `8` |
+| `--lr` | 非 PLM 参数学习率 | `4e-4` |
+| `--ptmlr` | PLM 学习率 | `1e-5` |
+| `--dropout` | dropout | `0.1` |
+| `--max_grad_norm` | 梯度裁剪 | `5.0` |
+
+### Loss
+
+| 参数 | 作用 | 默认 |
+|---|---|---|
+| `--ce_loss_weight` | CE 与 CL 的混合比例 | `0.1` |
+| `--angle_loss_weight` | anchor angle loss 权重 | `1.0` |
+| `--temp` | contrastive / prototype 温度 | `0.5` |
+| `--class_balanced_ce` | 是否启用类别均衡 CE | 关闭 |
+
+### Prototype / Anchor
+
+| 参数 | 作用 | 默认 |
+|---|---|---|
+| `--anchor_path` | anchor 文件目录 | 无 |
+| `--num_subanchors` | 每类 sub-anchor 数 | `1` |
+| `--prototype_pooling` | sub-anchor 聚合方式 | `max` |
+| `--prototype_momentum` | 动态更新 momentum | `0.9` |
+| `--disable_anchor_updates` | 禁止训练中更新 anchors | 关闭 |
+| `--disable_emo_anchor` | SupCon 中不拼接 emotion anchors | 关闭 |
+| `--use_nearest_neighbour` | 用 anchor scores 做预测 | 关闭 |
+
+### 二阶段
+
+| 参数 | 作用 | 默认 |
+|---|---|---|
+| `--disable_two_stage_training` | 禁用二阶段 | 关闭 |
+| `--stage_two_lr` | 二阶段分类器学习率 | `1e-4` |
+| `--force_two_stage` | entropy/domain_gated 下强制二阶段 | 关闭 |
+| `--save_stage_two_cache` | 保存二阶段 embedding cache | 关闭 |
+
+## 12. 与之前大改动版本的区别
+
+当前版本没有以下结构：
+
+- speaker memory
+- speaker state encoder
+- classifier-prototype adaptive fusion
+- neutral-aware SupCon
+- hard negative schedule
+- SAS / NSG 实验队列
+- rescue 实验集
+- confusion matrix 自动导出
+- 多组参数后台队列脚本
+
+也就是说，当前结构更接近原始 EACL 主干：
 
 ```text
-run_logs/sas_nsg_queue/{dataset}_{timestamp}/
+Prompted dialogue input
+  -> PLM
+  -> <mask> representation
+  -> classifier logits
+  -> mapped representation
+  -> emotion-anchor contrastive learning
+  -> optional nearest-neighbour anchor prediction
+  -> optional stage-2 anchor adaptation
 ```
 
-其中包括：
+## 13. 当前结构的优点与风险
 
-```text
-summary.csv
-leaderboard.csv
-trial*/train.stdout.log
-trial*/saved_models/{dataset}/logging.log
-trial*/saved_models/{dataset}/confusion_matrix.csv
-trial*/saved_models/{dataset}/similar_pair_confusion.csv
-```
+### 优点
 
-## 17. 当前模型结构图
+- 结构简单，变量少，便于定位实验结果变化。
+- Anchor 与 SupCon 是核心贡献，当前版本保留了主逻辑。
+- 二阶段 anchor adaptation 可单独观察对结果的提升。
+- `num_subanchors` 和 `prototype_pooling` 仍可做轻量实验。
 
-```mermaid
-flowchart TD
-    A[Dialogue turn + history] --> B[Prompt with mask]
-    B --> C[PLM encoder]
-    C --> D[Mask hidden state h_i]
+### 风险
 
-    S[Optional speaker_state text] --> S1[PLM encoder]
-    S1 --> S2[Speaker state r_i]
-    D --> F[Speaker state fusion]
-    S2 --> F
-    F --> U[Fused utterance u_i]
+- 当前 prompt 只显式利用文本上下文，没有显式建模 speaker 状态。
+- Anchor 动态更新可能带来漂移，尤其在少数类上。
+- `use_nearest_neighbour` 会让预测依赖 anchor 空间质量，而不是分类头。
+- `accumulation_step` 当前实现是按 `batch_id % accumulation_step == 0` 触发 optimizer step，严格来说第 0 个 batch 就会 step，一般不是标准梯度累积写法。
+- `run.sh` 固定 `CUDA_VISIBLE_DEVICES=3`，如果机器 GPU 编号不同，需要手动改。
 
-    U --> N[Neutral classifier]
-    N --> NP[neutral_prob]
+## 14. 建议后续实验从哪里开始
 
-    U --> CH[Classifier head]
-    CH --> CL[classifier logits]
+如果目标是恢复稳定结果，建议先只动少数参数：
 
-    E[Emotion anchors] --> M[Map function / domain adapters]
-    U --> M
-    M --> P[Prototype logits]
+1. 固定当前结构，不再加入新模块。
+2. 先比较：
 
-    U --> G[Domain gate]
-    S2 --> G
-    NP --> G
-    G --> W[Domain weights]
-    W --> P
+   ```bash
+   --use_nearest_neighbour
+   ```
 
-    CL --> X[Classifier-Prototype Fusion]
-    P --> X
-    X --> Y[Final logits / non-neutral logits]
-    NP --> Z[Final probability reconstruction]
-    Y --> Z
-    Z --> O[Prediction]
+   开与关的差别。
 
-    Y --> L[CE / neutral CE]
-    M --> L2[SupCon + Angle + SAS + Hard]
-    G --> L3[Gate entropy]
-    L --> T[Total loss]
-    L2 --> T
-    L3 --> T
-```
+3. 比较：
 
-## 18. 推荐运行命令
+   ```bash
+   --disable_anchor_updates
+   ```
 
-### 18.1 先跑少量 smoke test
+   开与关的差别，判断 prototype 动态更新是否带来漂移。
 
-```bash
-DATASET=IEMOCAP GPU_ID=0 EPOCHS=30 EXPERIMENT_SET=all MAX_RUNS=2 bash scripts/run_sas_nsg_background.sh
-```
+4. 保持 `num_subanchors=5`，只比较：
 
-### 18.2 跑完整 22 组
+   ```bash
+   --prototype_pooling max
+   --prototype_pooling logsumexp
+   ```
 
-```bash
-DATASET=IEMOCAP GPU_ID=0 EPOCHS=30 EXPERIMENT_SET=all bash scripts/run_sas_nsg_background.sh
-```
-
-### 18.3 只跑融合实验
-
-```bash
-DATASET=IEMOCAP GPU_ID=0 EPOCHS=30 EXPERIMENT_SET=fusion bash scripts/run_sas_nsg_background.sh
-```
-
-### 18.4 查看日志
-
-```bash
-tail -f run_logs/sas_nsg_queue/launcher_IEMOCAP_*.log
-```
-
-### 18.5 找排行榜
-
-```bash
-find run_logs/sas_nsg_queue -name leaderboard.csv -print
-```
-
-## 19. 当前结构的关键观察点
-
-后续实验建议重点观察：
-
-1. fusion alpha 是否提升 valid/test 同步表现；
-2. 关闭 hard negative 后，test 是否上升；
-3. 关闭 SAS + hard 后，相似情感混淆是否反而下降；
-4. `domain_gated` 是否比 `logsumexp` 更容易过拟合；
-5. `freeze_prototype_epochs=8` 是否说明动态 anchor 更新伤害了初始语义；
-6. `batch_size=16` 是否改善 SupCon 正负样本稳定性；
-7. `confusion_matrix.csv` 中 happy/excited、sad/frustrated、angry/frustrated 是否改善。
-
-## 20. 一句话总结
-
-当前模型可以理解为：
-
-```text
-PLM prompt encoder
-+ emotion semantic anchors
-+ multi-domain subanchor prototype head
-+ neutral decoupling
-+ speaker state fusion
-+ SAS / hard negative / gate entropy auxiliary losses
-+ classifier-prototype fusion
-+ unified background experiment queue
-```
-
-它已经从原始 EACL 的单一 anchor contrastive 框架，扩展成了一个可做消融、可做定向搜索、可分析相似情感混淆的 SAS-NSG-EACL 实验系统。
+5. 暂时不要重新加入 speaker memory / adaptive fusion / hard negative。

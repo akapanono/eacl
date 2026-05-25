@@ -14,6 +14,7 @@ warnings.filterwarnings("ignore")
 import logging
 from utils.data_process import *
 from model.model import CLModel, Classifier
+from model.anchor_utils import DOMAIN_NAMES
 from model.loss import loss_function
 import pickle
 os.environ["TOKENIZERS_PARALLELISM"] = "1"
@@ -186,8 +187,12 @@ def get_parser():
 
 if __name__ == '__main__':
     args = get_parser()
-    if args.prototype_pooling in ["entropy", "domain_gated"] and args.num_subanchors != 4:
-        raise ValueError(f"--prototype_pooling {args.prototype_pooling} expects --num_subanchors 4 so each subanchor index maps to one domain.")
+    if args.prototype_pooling in ["entropy", "domain_gated"] and args.num_subanchors != len(DOMAIN_NAMES):
+        raise ValueError(
+            f"--prototype_pooling {args.prototype_pooling} expects "
+            f"--num_subanchors {len(DOMAIN_NAMES)} so each subanchor index maps to one domain: "
+            f"{', '.join(DOMAIN_NAMES)}."
+        )
     if args.prototype_pooling in ["entropy", "domain_gated"] and not args.force_two_stage:
         args.disable_two_stage_training = True
     if args.fp16:

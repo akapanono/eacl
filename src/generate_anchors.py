@@ -9,6 +9,7 @@ from model.anchor_utils import (
     expand_templates,
     get_anchor_filename,
     get_dataset_emotions,
+    get_standard_anchor_templates,
 )
 warnings.filterwarnings("ignore")
 
@@ -35,6 +36,7 @@ if __name__ == "__main__":
     for dataset_name in ["IEMOCAP", "MELD", "EmoryNLP"]:
         emotions = get_dataset_emotions(dataset_name)
         templates = expand_templates(dataset_name, args.num_subanchors)
+        standard_templates = get_standard_anchor_templates(dataset_name)
         anchors = []
         centers = []
         with torch.no_grad():
@@ -44,8 +46,13 @@ if __name__ == "__main__":
                     emb = torch.tensor(feature_extractor(template, return_tensors="pt")[0]).mean(0)
                     subanchor_embeddings.append(emb.unsqueeze(0))
                 stacked = torch.cat(subanchor_embeddings, dim=0)
+                standard_embeddings = []
+                for template in standard_templates[emotion]:
+                    emb = torch.tensor(feature_extractor(template, return_tensors="pt")[0]).mean(0)
+                    standard_embeddings.append(emb.unsqueeze(0))
+                standard_center = torch.cat(standard_embeddings, dim=0).mean(0, keepdim=True)
                 anchors.append(stacked.unsqueeze(0))
-                centers.append(stacked.mean(0, keepdim=True))
+                centers.append(standard_center)
         anchors = torch.cat(anchors, dim=0)
         centers = torch.cat(centers, dim=0)
         anchor_file = f"./emo_anchors/{save_path}/{get_anchor_filename(dataset_name, args.num_subanchors)}"

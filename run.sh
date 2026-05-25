@@ -3,7 +3,7 @@ tmp=0.1
 ang_weight=0.1
 stage_two_lr=1e-4
 seed=1
-num_subanchors=3
+num_subanchors=5
 dataset=$1
 
 model_path=$2
