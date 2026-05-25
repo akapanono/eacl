@@ -1,4 +1,5 @@
 import csv
+import os
 import random
 import re
 import subprocess
@@ -11,10 +12,10 @@ from pathlib import Path
 # conda activate eacl
 # powershell -ExecutionPolicy Bypass -File .\launch_sweep_background.ps1 -PythonExe "C:\Users\Administrator\miniconda3\envs\eacl\python.exe"
 
-N_TRIALS = 100
-DATASET_NAME = "MELD"
-GPU_IDS = [0]
-MAX_PARALLEL_JOBS = 1
+N_TRIALS = int(os.environ.get("N_TRIALS", "100"))
+DATASET_NAME = os.environ.get("DATASET_NAME", os.environ.get("DATASET", "MELD"))
+GPU_IDS = [int(item.strip()) for item in os.environ.get("GPU_IDS", "0").split(",") if item.strip()]
+MAX_PARALLEL_JOBS = int(os.environ.get("MAX_PARALLEL_JOBS", "1"))
 AUTO_SCHEDULE_BY_GPU = True
 GPU_UTIL_THRESHOLD = 90
 MIN_FREE_MEMORY_MB = 5000
@@ -40,12 +41,12 @@ STEP_LR_SIZE = 5
 STEP_LR_GAMMA = 0.8
 CLASS_BALANCED_CE = True
 
-EPOCHS = 30
+EPOCHS = int(os.environ.get("EPOCHS", "30"))
 EARLY_STOP_PATIENCE = 5
 EARLY_STOP_METRIC = "valid"
 SAVE_BEST_METRIC = "valid"
 
-NUM_SUBANCHORS = 4
+NUM_SUBANCHORS = int(os.environ.get("NUM_SUBANCHORS", "5"))
 PROTOTYPE_POOLINGS = ["domain_gated", "logsumexp", "max"]
 DOMAIN_ENTROPY_EPS = 1e-6
 DOMAIN_ANCHOR_VARIANTS = 1
