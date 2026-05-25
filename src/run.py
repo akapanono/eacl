@@ -2,9 +2,8 @@ import os
 import numpy as np, argparse, time, pickle, random
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
-from trainer.trainer import  train_or_eval_model, retrain, unpack_batch
+from trainer.trainer import  train_or_eval_model, retrain
 from dataset import DialogueDataset
 from torch.utils.data import DataLoader, sampler, TensorDataset
 from transformers import AutoTokenizer
@@ -15,7 +14,6 @@ warnings.filterwarnings("ignore")
 import logging
 from utils.data_process import *
 from model.model import CLModel, Classifier
-from model.anchor_utils import get_dataset_emotions
 from model.loss import loss_function
 import pickle
 os.environ["TOKENIZERS_PARALLELISM"] = "1"
@@ -118,24 +116,16 @@ def get_parser():
     parser.add_argument('--wf', type=int, default=0, help='future window size')
     parser.add_argument("--ce_loss_weight", type=float, default=0.1)
     parser.add_argument("--angle_loss_weight", type=float, default=1.0)
-    parser.add_argument("--lambda_neu", type=float, default=0.2)
-    parser.add_argument("--lambda_supcon", type=float, default=0.2)
-    parser.add_argument("--lambda_angle", type=float, default=0.01)
-    parser.add_argument("--lambda_sas", type=float, default=0.005)
-    parser.add_argument("--lambda_hard", type=float, default=0.01)
-    parser.add_argument("--lambda_gate_entropy", type=float, default=0.001)
     parser.add_argument('--max_len', type=int, default=256,
                         help='max content length for each text, if set to 0, then the max length has no constrain')
     parser.add_argument("--temp", type=float, default=0.5)
     parser.add_argument('--accumulation_step', type=int, default=1)
-    parser.add_argument('--gradient_accumulation_steps', dest='accumulation_step', type=int,
-                        help='Alias for --accumulation_step.')
     parser.add_argument('--no_cuda', action='store_true', default=False, help='does not use GPU')
     parser.add_argument('--gpu_id', type=int, default=1, help='GPU id to use when CUDA is available')
 
     parser.add_argument('--dataset_name', default='IEMOCAP', type= str, help='dataset name, IEMOCAP or MELD or EmoryNLP')
 
-    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Gradient clipping.')
+    parser.add_argument('--max_grad_norm', type=float, default=5.0, help='Gradient clipping.')
 
     parser.add_argument('--lr', type=float, default=4e-4, metavar='LR', help='learning rate')
 
@@ -158,24 +148,8 @@ def get_parser():
                         help="Warmup ratio used by the cosine scheduler.")
     parser.add_argument("--class_balanced_ce", action="store_true",
                         help="Use inverse-frequency class weights in cross entropy.")
-    parser.add_argument("--use_neutral_decoupling", action="store_true",
-                        help="Use a separate neutral-vs-non-neutral branch before prototype matching.")
-    parser.add_argument("--use_speaker_state", action="store_true",
-                        help="Encode optional speaker_state text and fuse it into domain reasoning.")
-    parser.add_argument("--speaker_state_max_len", type=int, default=64)
-    parser.add_argument("--speaker_state_pooling", type=str, default="mean", choices=["mean", "cls"])
-    parser.add_argument("--use_speaker_memory", action="store_true",
-                        help="Encode same-speaker history and fuse it into the utterance representation.")
-    parser.add_argument("--speaker_memory_k", type=int, default=3)
-    parser.add_argument("--speaker_memory_max_len", type=int, default=128)
-    parser.add_argument("--speaker_memory_pooling", type=str, default="attention", choices=["mean", "cls", "attention"])
-    parser.add_argument("--use_state_fusion", action="store_true", default=True)
-    parser.add_argument("--disable_state_fusion", action="store_true")
-    parser.add_argument("--use_state_in_domain_gate", action="store_true", default=True)
-    parser.add_argument("--disable_state_in_domain_gate", action="store_true")
     ### Environment params
-    parser.add_argument("--fp16", action="store_true", default=False,
-                        help="Use autocast mixed precision. Disabled by default for numerical stability.")
+    parser.add_argument("--fp16", type=bool, default=True)
     parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--ignore_prompt_prefix", action="store_true", default=True)
     parser.add_argument("--disable_training_progress_bar", action="store_true")
@@ -190,37 +164,10 @@ def get_parser():
     parser.add_argument("--stage_two_lr", default=1e-4, type=float)
     parser.add_argument("--anchor_path", type=str)
     parser.add_argument("--num_subanchors", type=int, default=1)
-    parser.add_argument("--prototype_momentum", type=float, default=0.99)
+    parser.add_argument("--prototype_momentum", type=float, default=0.9)
     parser.add_argument("--prototype_pooling", type=str, default="max", choices=["max", "logsumexp", "entropy", "domain_gated"])
     parser.add_argument("--domain_entropy_eps", type=float, default=1e-6)
     parser.add_argument("--disable_anchor_updates", action="store_true")
-    parser.add_argument("--disable_prototype_update", action="store_true",
-                        help="Alias for --disable_anchor_updates. Stops momentum prototype updates.")
-    parser.add_argument("--freeze_prototype_epochs", type=int, default=2)
-    parser.add_argument("--normalize_prototypes_after_update", action="store_true", default=True)
-    parser.add_argument("--disable_prototype_normalization", action="store_true")
-    parser.add_argument("--use_similar_anchor_separation", action="store_true")
-    parser.add_argument("--use_hard_anchor_negative", action="store_true")
-    parser.add_argument("--use_classifier_prototype_fusion", action="store_true",
-                        help="Fuse classifier-head logits with prototype-head logits.")
-    parser.add_argument("--fusion_type", type=str, default="fixed", choices=["fixed", "adaptive"],
-                        help="Use fixed alpha or sample-wise adaptive fusion.")
-    parser.add_argument("--fusion_alpha", type=float, default=0.5,
-                        help="Classifier weight in classifier/prototype fusion.")
-    parser.add_argument("--use_neutral_aware_supcon", action="store_true",
-                        help="Use binary neutral/non-neutral SupCon plus non-neutral emotion SupCon.")
-    parser.add_argument("--lambda_neu_cl", type=float, default=0.1)
-    parser.add_argument("--lambda_emo_cl", type=float, default=0.2)
-    parser.add_argument("--hard_negative_schedule", type=str, default="constant", choices=["constant", "curriculum"])
-    parser.add_argument("--hard_warmup_epochs", type=int, default=3)
-    parser.add_argument("--hard_mild_epochs", type=int, default=8)
-    parser.add_argument("--hard_rho_warmup", type=float, default=0.0)
-    parser.add_argument("--hard_rho_mild", type=float, default=0.2)
-    parser.add_argument("--hard_rho_full", type=float, default=0.5)
-    parser.add_argument("--similar_emotion_pairs", type=str, default="happy:excited,sad:frustrated,angry:frustrated")
-    parser.add_argument("--sas_margin", type=float, default=0.30)
-    parser.add_argument("--hard_negative_rho", type=float, default=1.0)
-    parser.add_argument("--hard_negative_temperature", type=float, default=0.1)
     parser.add_argument("--early_stop_patience", type=int, default=0,
                         help="Stop stage 1 if the selected metric does not improve for N epochs. 0 disables early stopping.")
     parser.add_argument("--early_stop_metric", type=str, default="test", choices=["valid", "test"],
@@ -229,100 +176,19 @@ def get_parser():
                         help="Metric used to save the stage-1 checkpoint.")
     parser.add_argument("--force_two_stage", action="store_true",
                         help="Force stage-2 training even for domain-aware pooling modes.")
-    parser.add_argument("--debug_finite_checks", action="store_true",
-                        help="Check model parameters and buffers for NaN/Inf after optimizer steps.")
-    parser.add_argument("--prototype_update_policy", type=str, default="momentum",
-                        choices=["momentum", "validation_guarded"])
-    parser.add_argument("--prototype_stop_update_patience", type=int, default=2)
     
     # analysis
     parser.add_argument("--save_stage_two_cache", action="store_true")
     parser.add_argument("--save_path", default='./saved_models/', type=str)
 
     args = parser.parse_args()
-    if args.disable_state_fusion:
-        args.use_state_fusion = False
-    if args.disable_state_in_domain_gate:
-        args.use_state_in_domain_gate = False
-    if args.disable_prototype_normalization:
-        args.normalize_prototypes_after_update = False
-    if args.disable_prototype_update:
-        args.disable_anchor_updates = True
     return args
-
-def parse_similar_pairs_text(pairs):
-    parsed = []
-    for item in str(pairs).split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if ":" in item:
-            left, right = item.split(":", 1)
-        elif "-" in item:
-            left, right = item.split("-", 1)
-        else:
-            continue
-        parsed.append((left.strip().lower(), right.strip().lower()))
-    return parsed
-
-def flatten_eval_tensors(label_batches, pred_batches):
-    labels, preds = [], []
-    for batch_labels, batch_preds in zip(label_batches, pred_batches):
-        for label, pred in zip(batch_labels, batch_preds):
-            label_value = int(label.detach().cpu().item())
-            if label_value == -1:
-                continue
-            labels.append(label_value)
-            preds.append(int(pred.detach().cpu().item()))
-    return labels, preds
-
-def save_confusion_reports(args, label_batches, pred_batches):
-    labels, preds = flatten_eval_tensors(label_batches, pred_batches)
-    if not labels:
-        return
-    label_names = get_dataset_emotions(args.dataset_name)
-    n_classes = len(label_names)
-    matrix = np.zeros((n_classes, n_classes), dtype=int)
-    for label, pred in zip(labels, preds):
-        if 0 <= label < n_classes and 0 <= pred < n_classes:
-            matrix[label, pred] += 1
-
-    out_dir = os.path.join(args.save_path, args.dataset_name)
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "confusion_matrix.csv"), "w", encoding="utf-8") as f:
-        f.write("label," + ",".join(label_names) + "\n")
-        for idx, name in enumerate(label_names):
-            f.write(name + "," + ",".join(str(value) for value in matrix[idx].tolist()) + "\n")
-
-    label_to_id = {name.lower(): idx for idx, name in enumerate(label_names)}
-    with open(os.path.join(out_dir, "similar_pair_confusion.csv"), "w", encoding="utf-8") as f:
-        f.write("left,right,left_to_right,right_to_left,total,count_left,count_right,rate\n")
-        for left, right in parse_similar_pairs_text(args.similar_emotion_pairs):
-            if left not in label_to_id or right not in label_to_id:
-                continue
-            left_id = label_to_id[left]
-            right_id = label_to_id[right]
-            left_to_right = int(matrix[left_id, right_id])
-            right_to_left = int(matrix[right_id, left_id])
-            total = left_to_right + right_to_left
-            denom = int(matrix[left_id].sum() + matrix[right_id].sum())
-            rate = total / denom if denom else 0.0
-            f.write(f"{left},{right},{left_to_right},{right_to_left},{total},{int(matrix[left_id].sum())},{int(matrix[right_id].sum())},{rate:.6f}\n")
 
 if __name__ == '__main__':
     args = get_parser()
     if args.prototype_pooling in ["entropy", "domain_gated"] and args.num_subanchors != 4:
         raise ValueError(f"--prototype_pooling {args.prototype_pooling} expects --num_subanchors 4 so each subanchor index maps to one domain.")
-    uses_sas_nsg = any([
-        args.use_neutral_decoupling,
-        args.use_speaker_state,
-        args.use_speaker_memory,
-        args.use_similar_anchor_separation,
-        args.use_hard_anchor_negative,
-        args.use_classifier_prototype_fusion,
-        args.use_neutral_aware_supcon,
-    ])
-    if (args.prototype_pooling in ["entropy", "domain_gated"] or uses_sas_nsg) and not args.force_two_stage:
+    if args.prototype_pooling in ["entropy", "domain_gated"] and not args.force_two_stage:
         args.disable_two_stage_training = True
     if args.fp16:
         torch.set_float32_matmul_precision('medium')
@@ -373,7 +239,6 @@ if __name__ == '__main__':
         model.f_context_encoder.gradient_checkpointing_enable()
     device = f"cuda:{args.gpu_id}" if args.cuda else "cpu"
     model = model.to(device)
-    init_anchor = model.emo_anchor.detach().clone()
     if args.class_balanced_ce:
         model.ce_class_weights = compute_class_weights(trainset.labels, n_classes, device)
         logger.info("class-balanced CE weights: {}".format(model.ce_class_weights.detach().cpu().tolist()))
@@ -398,48 +263,23 @@ if __name__ == '__main__':
     best_checkpoint_score = -1
     early_stop_score = -1
     stale_epochs = 0
-    prototype_update_prev_valid = None
-    prototype_update_stale = 0
     anchor_dist = []
     for e in range(n_epochs):
         start_time = time.time()
         
-        train_loss, train_acc, _, _, train_fscore, train_detail_f1, max_cosine, train_stats  = \
+        train_loss, train_acc, _, _, train_fscore, train_detail_f1, max_cosine  = \
             train_or_eval_model(model, loss_function, train_loader, e, device, args, optimizer, lr_scheduler, True)
         if args.lr_scheduler == "step":
             lr_scheduler.step()
-        valid_loss, valid_acc, _, _, valid_fscore, valid_detail_f1, _, valid_stats = \
+        valid_loss, valid_acc, _, _, valid_fscore, valid_detail_f1, _ = \
             train_or_eval_model(model, loss_function, valid_loader, e, device, args)
-        test_loss, test_acc, test_label, test_pred, test_fscore, test_detail_f1, _, test_stats = \
+        test_loss, test_acc, test_label, test_pred, test_fscore, test_detail_f1, _ = \
             train_or_eval_model(model, loss_function, test_loader, e, device, args)
         all_fscore.append([valid_fscore, test_fscore, test_detail_f1])
 
         logger.info( 'Epoch: {}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'. \
             format(e + 1, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc,
             test_fscore, round(time.time() - start_time, 2)))
-        current_anchor = model.emo_anchor.detach()
-        prototype_drift = (
-            1.0 - F.cosine_similarity(init_anchor.flatten(1), current_anchor.flatten(1), dim=-1)
-        ).mean().item()
-        train_stats["prototype_drift"] = round(float(prototype_drift), 6)
-        valid_stats["prototype_drift"] = round(float(prototype_drift), 6)
-        test_stats["prototype_drift"] = round(float(prototype_drift), 6)
-        logger.info('Loss/detail stats: train={}, valid={}, test={}'.format(train_stats, valid_stats, test_stats))
-
-        if args.prototype_update_policy == "validation_guarded" and hasattr(model, "prototype_updates_stopped"):
-            if prototype_update_prev_valid is not None and valid_fscore < prototype_update_prev_valid:
-                prototype_update_stale += 1
-            else:
-                prototype_update_stale = 0
-            prototype_update_prev_valid = valid_fscore
-            if prototype_update_stale >= args.prototype_stop_update_patience and not model.prototype_updates_stopped:
-                model.prototype_updates_stopped = True
-                logger.info(
-                    "Prototype updates stopped at epoch {} because valid_fscore declined for {} epoch(s).".format(
-                        e + 1,
-                        args.prototype_stop_update_patience,
-                    )
-                )
 
         if valid_fscore > best_valid_fscore:
             best_valid_fscore = valid_fscore
@@ -455,7 +295,6 @@ if __name__ == '__main__':
             best_model = copy.deepcopy(model)
             best_checkpoint_score = checkpoint_score
             torch.save(model.state_dict(), path + args.dataset_name + '/model_' + '.pkl')
-            save_confusion_reports(args, test_label, test_pred)
 
         current_early_stop_score = test_fscore if args.early_stop_metric == "test" else valid_fscore
         if current_early_stop_score > early_stop_score:
@@ -501,112 +340,40 @@ if __name__ == '__main__':
             emb_train, emb_val, emb_test = [] ,[] ,[]
             label_train, label_val, label_test = [], [], []
             for batch_id, batch in enumerate(train_loader):
-                input_ids, label, state_input_ids, state_attention_mask, memory_input_ids, memory_attention_mask = unpack_batch(batch)
+                input_ids, label = batch
                 input_orig = input_ids
                 input_aug = None
                 input_ids = input_orig.to(device)
                 label = label.to(device)
-                if state_input_ids is not None:
-                    state_input_ids = state_input_ids.to(device)
-                if state_attention_mask is not None:
-                    state_attention_mask = state_attention_mask.to(device)
-                if memory_input_ids is not None:
-                    memory_input_ids = memory_input_ids.to(device)
-                if memory_attention_mask is not None:
-                    memory_attention_mask = memory_attention_mask.to(device)
                 if args.fp16:
                     with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(
-                            input_ids,
-                            state_input_ids=state_input_ids,
-                            state_attention_mask=state_attention_mask,
-                            memory_input_ids=memory_input_ids,
-                            memory_attention_mask=memory_attention_mask,
-                            return_mask_output=True,
-                        ) 
-                else:
-                    log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(
-                        input_ids,
-                        state_input_ids=state_input_ids,
-                        state_attention_mask=state_attention_mask,
-                        memory_input_ids=memory_input_ids,
-                        memory_attention_mask=memory_attention_mask,
-                        return_mask_output=True,
-                    )
+                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(input_ids, return_mask_output=True) 
                 emb_train.append(masked_mapped_output.detach().cpu())
                 label_train.append(label.cpu())
             emb_train = torch.cat(emb_train, dim=0)
             label_train = torch.cat(label_train, dim=0)
             for batch_id, batch in enumerate(valid_loader):
-                input_ids, label, state_input_ids, state_attention_mask, memory_input_ids, memory_attention_mask = unpack_batch(batch)
+                input_ids, label = batch
                 input_orig = input_ids
                 input_aug = None
                 input_ids = input_orig.to(device)
                 label = label.to(device)
-                if state_input_ids is not None:
-                    state_input_ids = state_input_ids.to(device)
-                if state_attention_mask is not None:
-                    state_attention_mask = state_attention_mask.to(device)
-                if memory_input_ids is not None:
-                    memory_input_ids = memory_input_ids.to(device)
-                if memory_attention_mask is not None:
-                    memory_attention_mask = memory_attention_mask.to(device)
                 if args.fp16:
                     with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(
-                            input_ids,
-                            state_input_ids=state_input_ids,
-                            state_attention_mask=state_attention_mask,
-                            memory_input_ids=memory_input_ids,
-                            memory_attention_mask=memory_attention_mask,
-                            return_mask_output=True,
-                        ) 
-                else:
-                    log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(
-                        input_ids,
-                        state_input_ids=state_input_ids,
-                        state_attention_mask=state_attention_mask,
-                        memory_input_ids=memory_input_ids,
-                        memory_attention_mask=memory_attention_mask,
-                        return_mask_output=True,
-                    )
+                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(input_ids, return_mask_output=True) 
                 emb_val.append(masked_mapped_output.detach().cpu())
                 label_val.append(label.cpu())
             emb_val = torch.cat(emb_val, dim=0)
             label_val = torch.cat(label_val, dim=0)
             for batch_id, batch in enumerate(test_loader):
-                input_ids, label, state_input_ids, state_attention_mask, memory_input_ids, memory_attention_mask = unpack_batch(batch)
+                input_ids, label = batch
                 input_orig = input_ids
                 input_aug = None
                 input_ids = input_orig.to(device)
                 label = label.to(device)
-                if state_input_ids is not None:
-                    state_input_ids = state_input_ids.to(device)
-                if state_attention_mask is not None:
-                    state_attention_mask = state_attention_mask.to(device)
-                if memory_input_ids is not None:
-                    memory_input_ids = memory_input_ids.to(device)
-                if memory_attention_mask is not None:
-                    memory_attention_mask = memory_attention_mask.to(device)
                 if args.fp16:
                     with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(
-                            input_ids,
-                            state_input_ids=state_input_ids,
-                            state_attention_mask=state_attention_mask,
-                            memory_input_ids=memory_input_ids,
-                            memory_attention_mask=memory_attention_mask,
-                            return_mask_output=True,
-                        ) 
-                else:
-                    log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(
-                        input_ids,
-                        state_input_ids=state_input_ids,
-                        state_attention_mask=state_attention_mask,
-                        memory_input_ids=memory_input_ids,
-                        memory_attention_mask=memory_attention_mask,
-                        return_mask_output=True,
-                    )
+                        log_prob, masked_mapped_output, masked_outputs, anchor_scores = model(input_ids, return_mask_output=True) 
                 emb_test.append(masked_mapped_output.detach().cpu())
                 label_test.append(label.cpu())
             emb_test = torch.cat(emb_test, dim=0)

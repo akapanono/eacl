@@ -26,22 +26,14 @@ ANCHOR_PATH = str(Path("emo_anchors") / "sup-simcse-roberta-large")
 BERT_PATH = str(Path("pretrained") / "sup-simcse-roberta-large")
 
 SEEDS = [49,4668,12334,4998,5684]
-LRS = [3e-5, 5e-5, 8e-5, 1e-4]
-PTM_LRS = [3e-6, 5e-6, 8e-6, 1e-5]
-DROPOUTS = [0.2, 0.25, 0.3]
-BATCH_SIZES = [8, 16]
-TEMPS = [0.2, 0.3, 0.5]
-PROTOTYPE_MOMENTUMS = [0.99, 0.995]
-MAX_GRAD_NORMS = [0.5, 1.0]
-FREEZE_PROTOTYPE_EPOCHS = [2, 3]
+LRS = [5e-5, 1e-4, 2e-4, 3e-4]
+PTM_LRS = [5e-6, 8e-6, 1e-5, 1.5e-5, 2e-5]
+DROPOUTS = [0.1, 0.15, 0.2, 0.25,0.18,0.3]
+BATCH_SIZES = [8, 16,32]
+TEMPS = [0.1, 0.2, 0.3]
+PROTOTYPE_MOMENTUMS = [0.9, 0.95, 0.98, 0.99]
 CE_LOSS_WEIGHTS = [0.3, 0.4, 0.5, 0.6]
-ANGLE_LOSS_WEIGHTS = [0.005, 0.01, 0.02]
-LAMBDA_NEUS = [0.1, 0.2, 0.3]
-LAMBDA_SUPCONS = [0.1, 0.2, 0.5]
-LAMBDA_ANGLES = [0.005, 0.01, 0.02]
-LAMBDA_SASES = [0.002, 0.005]
-LAMBDA_HARDS = [0.0, 0.005, 0.01]
-LAMBDA_GATE_ENTROPIES = [0.0, 0.001, 0.002]
+ANGLE_LOSS_WEIGHTS = [0.05, 0.1, 0.2]
 LR_SCHEDULER = "cosine"
 WARMUP_RATIO = 0.08
 STEP_LR_SIZE = 5
@@ -63,14 +55,6 @@ DOMAIN_VARIANT_TEMPS = [0.2]
 USE_NEAREST_NEIGHBOUR = True
 DISABLE_TRAINING_PROGRESS_BAR = True
 DISABLE_ANCHOR_UPDATES_CHOICES = [False, True]
-USE_NEUTRAL_DECOUPLING_CHOICES = [False, True]
-USE_SPEAKER_STATE_CHOICES = [False, True]
-USE_SIMILAR_ANCHOR_SEPARATION_CHOICES = [False, True]
-USE_HARD_ANCHOR_NEGATIVE_CHOICES = [False, True]
-SIMILAR_EMOTION_PAIRS = "happy:excited,sad:frustrated,angry:frustrated"
-SAS_MARGINS = [0.25, 0.3, 0.35]
-HARD_NEGATIVE_RHOS = [0.5, 1.0]
-HARD_NEGATIVE_TEMPS = [0.1, 0.2]
 
 if not USE_IMPROVED_TRAINING:
     LRS = [1e-4, 2e-4, 3e-4, 4e-4, 1e-5]
@@ -83,10 +67,6 @@ if not USE_IMPROVED_TRAINING:
     CLASS_BALANCED_CE = False
     PROTOTYPE_POOLINGS = ["domain_gated"]
     DISABLE_ANCHOR_UPDATES_CHOICES = [False]
-    USE_NEUTRAL_DECOUPLING_CHOICES = [False]
-    USE_SPEAKER_STATE_CHOICES = [False]
-    USE_SIMILAR_ANCHOR_SEPARATION_CHOICES = [False]
-    USE_HARD_ANCHOR_NEGATIVE_CHOICES = [False]
 
 LOG_DIR = Path("sweep_logs")
 SUMMARY_FILE = LOG_DIR / "summary.tsv"
@@ -131,25 +111,10 @@ def sample_config(trial_id):
         "batch_size": random.choice(BATCH_SIZES),
         "temp": random.choice(TEMPS),
         "prototype_momentum": random.choice(PROTOTYPE_MOMENTUMS),
-        "max_grad_norm": random.choice(MAX_GRAD_NORMS),
-        "freeze_prototype_epochs": random.choice(FREEZE_PROTOTYPE_EPOCHS),
         "ce_loss_weight": random.choice(CE_LOSS_WEIGHTS),
         "angle_loss_weight": random.choice(ANGLE_LOSS_WEIGHTS),
-        "lambda_neu": random.choice(LAMBDA_NEUS),
-        "lambda_supcon": random.choice(LAMBDA_SUPCONS),
-        "lambda_angle": random.choice(LAMBDA_ANGLES),
-        "lambda_sas": random.choice(LAMBDA_SASES),
-        "lambda_hard": random.choice(LAMBDA_HARDS),
-        "lambda_gate_entropy": random.choice(LAMBDA_GATE_ENTROPIES),
         "prototype_pooling": random.choice(PROTOTYPE_POOLINGS),
         "disable_anchor_updates": random.choice(DISABLE_ANCHOR_UPDATES_CHOICES),
-        "use_neutral_decoupling": random.choice(USE_NEUTRAL_DECOUPLING_CHOICES),
-        "use_speaker_state": random.choice(USE_SPEAKER_STATE_CHOICES),
-        "use_similar_anchor_separation": random.choice(USE_SIMILAR_ANCHOR_SEPARATION_CHOICES),
-        "use_hard_anchor_negative": random.choice(USE_HARD_ANCHOR_NEGATIVE_CHOICES),
-        "sas_margin": random.choice(SAS_MARGINS),
-        "hard_negative_rho": random.choice(HARD_NEGATIVE_RHOS),
-        "hard_negative_temperature": random.choice(HARD_NEGATIVE_TEMPS),
     }
 
 
@@ -165,23 +130,11 @@ def build_command(cfg):
         "--temp", fmt_float(cfg["temp"]),
         "--seed", str(cfg["seed"]),
         "--angle_loss_weight", fmt_float(cfg["angle_loss_weight"]),
-        "--lambda_neu", fmt_float(cfg["lambda_neu"]),
-        "--lambda_supcon", fmt_float(cfg["lambda_supcon"]),
-        "--lambda_angle", fmt_float(cfg["lambda_angle"]),
-        "--lambda_sas", fmt_float(cfg["lambda_sas"]),
-        "--lambda_hard", fmt_float(cfg["lambda_hard"]),
         "--stage_two_lr", "1e-4",
         "--num_subanchors", str(NUM_SUBANCHORS),
         "--prototype_pooling", cfg["prototype_pooling"],
         "--domain_entropy_eps", fmt_float(DOMAIN_ENTROPY_EPS),
         "--prototype_momentum", fmt_float(cfg["prototype_momentum"]),
-        "--max_grad_norm", fmt_float(cfg["max_grad_norm"]),
-        "--freeze_prototype_epochs", str(cfg["freeze_prototype_epochs"]),
-        "--similar_emotion_pairs", SIMILAR_EMOTION_PAIRS,
-        "--sas_margin", fmt_float(cfg["sas_margin"]),
-        "--hard_negative_rho", fmt_float(cfg["hard_negative_rho"]),
-        "--hard_negative_temperature", fmt_float(cfg["hard_negative_temperature"]),
-        "--lambda_gate_entropy", fmt_float(cfg["lambda_gate_entropy"]),
         "--dropout", fmt_float(cfg["dropout"]),
         "--lr", fmt_float(cfg["lr"]),
         "--ptmlr", fmt_float(cfg["ptmlr"]),
@@ -203,15 +156,6 @@ def build_command(cfg):
         cmd.append("--class_balanced_ce")
     if cfg["disable_anchor_updates"]:
         cmd.append("--disable_anchor_updates")
-    if cfg["use_neutral_decoupling"]:
-        cmd.append("--use_neutral_decoupling")
-    if cfg["use_speaker_state"]:
-        cmd.append("--use_speaker_state")
-    if cfg["use_similar_anchor_separation"]:
-        cmd.append("--use_similar_anchor_separation")
-    if cfg["use_hard_anchor_negative"]:
-        cmd.append("--use_hard_anchor_negative")
-    cmd.append("--normalize_prototypes_after_update")
     return cmd
 
 
@@ -228,10 +172,6 @@ def make_log_path(cfg):
         f"mom{safe_tag(fmt_float(cfg['prototype_momentum']))}",
         f"ce{safe_tag(fmt_float(cfg['ce_loss_weight']))}",
         f"angle{safe_tag(fmt_float(cfg['angle_loss_weight']))}",
-        f"nd{int(cfg['use_neutral_decoupling'])}",
-        f"sg{int(cfg['use_speaker_state'])}",
-        f"sas{int(cfg['use_similar_anchor_separation'])}",
-        f"hard{int(cfg['use_hard_anchor_negative'])}",
         stamp,
     ]
     return LOG_DIR / ("_".join(parts) + ".log")
@@ -258,12 +198,8 @@ def append_summary(row):
         "status", "start_time", "end_time", "duration_sec",
         "trial", "best_test", "best_test_epoch", "best_valid", "best_valid_epoch",
         "seed", "lr", "ptmlr", "dropout", "batch_size", "temp",
-        "prototype_pooling", "prototype_momentum", "max_grad_norm", "freeze_prototype_epochs",
-        "ce_loss_weight", "angle_loss_weight", "lambda_neu", "lambda_supcon", "lambda_angle",
-        "lambda_sas", "lambda_hard", "lambda_gate_entropy",
+        "prototype_pooling", "prototype_momentum", "ce_loss_weight", "angle_loss_weight",
         "lr_scheduler", "warmup_ratio", "class_balanced_ce",
-        "use_neutral_decoupling", "use_speaker_state", "use_similar_anchor_separation",
-        "use_hard_anchor_negative", "sas_margin", "hard_negative_rho", "hard_negative_temperature",
         "disable_anchor_updates", "gpu_id", "returncode", "command", "log",
     ]
     exists = SUMMARY_FILE.exists()
@@ -296,8 +232,6 @@ def print_leaderboard(results, top_k=10):
             f"bs={row['batch_size']} temp={row['temp']} pool={row['prototype_pooling']} "
             f"mom={row['prototype_momentum']} "
             f"ce={row['ce_loss_weight']} angle={row['angle_loss_weight']} "
-            f"nd={row['use_neutral_decoupling']} sg={row['use_speaker_state']} "
-            f"sas={row['use_similar_anchor_separation']} hard={row['use_hard_anchor_negative']} "
             f"gpu={row['gpu_id']} "
             f"log={row['log']}"
         )

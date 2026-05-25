@@ -2,11 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel
 import torch.nn.functional as F
-from model.anchor_utils import load_anchor_tensor, get_dataset_emotions
-
-
-def _flag(args, name, default=False):
-    return bool(getattr(args, name, default))
+from model.anchor_utils import load_anchor_tensor
 
 class CLModel(nn.Module):
     def __init__(self, args, n_classes, tokenizer=None):
@@ -29,43 +25,12 @@ class CLModel(nn.Module):
             # nn.ReLU(),
             nn.Linear(self.dim, self.num_classes)
         )
-        self.use_neutral_decoupling = _flag(args, "use_neutral_decoupling")
-        self.use_speaker_state = _flag(args, "use_speaker_state")
-        self.use_speaker_memory = _flag(args, "use_speaker_memory")
-        self.use_state_fusion = _flag(args, "use_state_fusion", True)
-        self.use_state_in_domain_gate = _flag(args, "use_state_in_domain_gate", True)
         self.map_function = nn.Sequential(
             nn.Linear(self.dim, self.dim),
             nn.LayerNorm(self.dim),
             nn.ReLU(),
             nn.Linear(self.dim, args.mapping_lower_dim),
         ).to(self.device)
-        self.neutral_classifier = nn.Sequential(
-            nn.Dropout(self.dropout),
-            nn.Linear(self.dim, self.dim),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.dim, 1),
-        ).to(self.device)
-        self.state_proj = nn.Linear(self.dim, self.dim).to(self.device)
-        self.state_gate = nn.Sequential(
-            nn.Linear(self.dim * 2, self.dim),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.dim, self.dim),
-            nn.Sigmoid(),
-        ).to(self.device)
-        self.state_fusion_norm = nn.LayerNorm(self.dim).to(self.device)
-        self.memory_proj = nn.Linear(self.dim, self.dim).to(self.device)
-        self.memory_gate = nn.Sequential(
-            nn.Linear(self.dim * 2, self.dim),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.dim, self.dim),
-            nn.Sigmoid(),
-        ).to(self.device)
-        self.memory_fusion_norm = nn.LayerNorm(self.dim).to(self.device)
-        self.memory_attention = nn.Linear(self.dim, 1).to(self.device)
         self.domain_adapters = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(self.dim, self.dim),
@@ -76,18 +41,10 @@ class CLModel(nn.Module):
             )
             for _ in range(args.num_subanchors)
         ]).to(self.device)
-        gate_input_dim = self.dim
-        if self.use_speaker_state and self.use_state_in_domain_gate:
-            gate_input_dim += self.dim
-        if self.use_speaker_memory:
-            gate_input_dim += self.dim
-        if self.use_neutral_decoupling:
-            gate_input_dim += 1
         self.domain_gate = nn.Sequential(
-            nn.Linear(gate_input_dim, self.dim // 2),
+            nn.Linear(self.dim, self.dim // 2),
             nn.LayerNorm(self.dim // 2),
             nn.ReLU(),
-            nn.Dropout(self.dropout),
             nn.Linear(self.dim // 2, args.num_subanchors),
         ).to(self.device)
 
@@ -95,44 +52,10 @@ class CLModel(nn.Module):
         anchor_tensor = load_anchor_tensor(args.anchor_path, args.dataset_name, args.num_subanchors).float()
         self.register_buffer("emo_anchor", anchor_tensor.to(self.device))
         self.num_subanchors = self.emo_anchor.shape[1]
-        label_names = get_dataset_emotions(args.dataset_name)
-        self.label_names = label_names
-        self.neutral_id = label_names.index("neutral") if "neutral" in label_names else None
-        if self.neutral_id is None:
-            self.use_neutral_decoupling = False
-            self.args.use_neutral_decoupling = False
-        self.non_neutral_label_ids = [
-            idx for idx in range(self.num_classes)
-            if idx != self.neutral_id
-        ]
-        original_to_non_neutral = torch.full((self.num_classes,), -1, dtype=torch.long)
-        for non_neutral_id, original_id in enumerate(self.non_neutral_label_ids):
-            original_to_non_neutral[original_id] = non_neutral_id
-        self.register_buffer("original_to_non_neutral", original_to_non_neutral.to(self.device))
-        self.register_buffer(
-            "non_neutral_to_original",
-            torch.tensor(self.non_neutral_label_ids, dtype=torch.long).to(self.device)
-        )
-        active_classes = len(self.non_neutral_label_ids) if self.use_neutral_decoupling else self.num_classes
         self.register_buffer(
             "emo_label",
-            torch.arange(active_classes, dtype=torch.long).repeat_interleave(self.num_subanchors).to(self.device)
+            torch.arange(self.num_classes, dtype=torch.long).repeat_interleave(self.num_subanchors).to(self.device)
         )
-        self.last_forward_output = {}
-        self.last_gate_entropy = None
-        self.current_epoch = 0
-        self.use_classifier_prototype_fusion = _flag(args, "use_classifier_prototype_fusion")
-        self.fusion_type = getattr(args, "fusion_type", "fixed")
-        self.fusion_alpha = float(getattr(args, "fusion_alpha", 0.5))
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(self.dim + 3, self.dim // 2),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.dim // 2, 1),
-            nn.Sigmoid(),
-        ).to(self.device)
-        self.last_fusion_alpha = None
-        self.prototype_updates_stopped = False
 
     def device(self):
         return self.f_context_encoder.device
@@ -144,14 +67,12 @@ class CLModel(nn.Module):
         if scores.dim() != 3:
             return scores
         if self.args.prototype_pooling == "entropy":
-            domain_logits = (scores.transpose(1, 2) / self.args.temp).clamp(min=-50.0, max=50.0)
+            domain_logits = scores.transpose(1, 2) / self.args.temp
             domain_probs = F.softmax(domain_logits, dim=-1)
             entropy = -(domain_probs * torch.log(domain_probs + self.eps)).sum(dim=-1)
             domain_weights = 1.0 / (entropy + self.args.domain_entropy_eps)
             domain_weights = domain_weights / (domain_weights.sum(dim=-1, keepdim=True) + self.eps)
             fused_probs = (domain_weights.unsqueeze(-1) * domain_probs).sum(dim=1)
-            fused_probs = fused_probs.clamp(min=self.eps, max=1.0)
-            fused_probs = fused_probs / fused_probs.sum(dim=-1, keepdim=True).clamp_min(self.eps)
             self.last_domain_probs = domain_probs.detach()
             self.last_domain_weights = domain_weights.detach()
             self.last_domain_entropy = entropy.detach()
@@ -160,96 +81,19 @@ class CLModel(nn.Module):
             return torch.logsumexp(scores / self.args.temp, dim=-1)
         return scores.max(dim=-1)[0]
 
-    def _active_anchors(self):
-        if self.use_neutral_decoupling:
-            return self.emo_anchor[self.non_neutral_to_original]
-        return self.emo_anchor
-
     def get_mapped_anchors(self):
-        anchors = self._active_anchors()
-        flat_anchor = anchors.reshape(-1, self.dim)
+        flat_anchor = self.emo_anchor.view(-1, self.dim)
         mapped = self.map_function(flat_anchor)
-        return mapped.view(anchors.shape[0], self.num_subanchors, -1)
+        return mapped.view(self.num_classes, self.num_subanchors, -1)
 
     def get_domain_mapped_anchors(self):
         domain_anchors = []
-        anchors = self._active_anchors()
         for domain_id, adapter in enumerate(self.domain_adapters):
-            domain_anchor = anchors[:, domain_id, :]
+            domain_anchor = self.emo_anchor[:, domain_id, :]
             domain_anchors.append(adapter(domain_anchor).unsqueeze(1))
         return torch.cat(domain_anchors, dim=1)
 
-    def encode_speaker_state(self, state_input_ids=None, state_attention_mask=None):
-        if not self.use_speaker_state or state_input_ids is None:
-            return None
-        if state_attention_mask is None:
-            state_attention_mask = (state_input_ids != self.pad_value).long()
-        state_encoded = self.f_context_encoder(
-            input_ids=state_input_ids,
-            attention_mask=state_attention_mask,
-            output_hidden_states=True,
-            return_dict=True
-        )["last_hidden_state"]
-        if getattr(self.args, "speaker_state_pooling", "mean") == "cls":
-            return state_encoded[:, 0]
-        mask = state_attention_mask.unsqueeze(-1).float()
-        return (state_encoded * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
-
-    def encode_speaker_memory(self, memory_input_ids=None, memory_attention_mask=None):
-        if not self.use_speaker_memory or memory_input_ids is None:
-            return None
-        if memory_attention_mask is None:
-            memory_attention_mask = (memory_input_ids != self.pad_value).long()
-        memory_encoded = self.f_context_encoder(
-            input_ids=memory_input_ids,
-            attention_mask=memory_attention_mask,
-            output_hidden_states=True,
-            return_dict=True
-        )["last_hidden_state"]
-        valid_counts = memory_attention_mask.sum(dim=1, keepdim=True)
-        if getattr(self.args, "speaker_memory_pooling", "attention") == "cls":
-            memory = memory_encoded[:, 0]
-        elif getattr(self.args, "speaker_memory_pooling", "attention") == "mean":
-            mask = memory_attention_mask.unsqueeze(-1).float()
-            memory = (memory_encoded * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
-        else:
-            attn_logits = self.memory_attention(memory_encoded).squeeze(-1)
-            attn_logits = attn_logits.masked_fill(memory_attention_mask == 0, -1e4)
-            attn = F.softmax(attn_logits, dim=-1).unsqueeze(-1)
-            memory = (memory_encoded * attn).sum(dim=1)
-        return torch.where(valid_counts > 0, memory, torch.zeros_like(memory))
-
-    def fuse_speaker_state(self, mask_outputs, state_outputs):
-        if state_outputs is None or not self.use_state_fusion:
-            return mask_outputs
-        state_projected = self.state_proj(state_outputs)
-        state_alpha = self.state_gate(torch.cat([mask_outputs, state_projected], dim=-1))
-        return self.state_fusion_norm(mask_outputs + state_alpha * state_projected)
-
-    def fuse_speaker_memory(self, mask_outputs, memory_outputs):
-        if memory_outputs is None:
-            return mask_outputs
-        memory_projected = self.memory_proj(memory_outputs)
-        memory_alpha = self.memory_gate(torch.cat([mask_outputs, memory_projected], dim=-1))
-        return self.memory_fusion_norm(mask_outputs + memory_alpha * memory_projected)
-
-    def _domain_gate_input(self, fused_outputs, state_outputs=None, memory_outputs=None, neutral_prob=None):
-        gate_inputs = [fused_outputs]
-        if self.use_speaker_state and self.use_state_in_domain_gate:
-            if state_outputs is None:
-                state_outputs = torch.zeros_like(fused_outputs)
-            gate_inputs.append(state_outputs)
-        if self.use_speaker_memory:
-            if memory_outputs is None:
-                memory_outputs = torch.zeros_like(fused_outputs)
-            gate_inputs.append(memory_outputs)
-        if self.use_neutral_decoupling:
-            if neutral_prob is None:
-                neutral_prob = torch.zeros(fused_outputs.shape[0], 1, device=fused_outputs.device, dtype=fused_outputs.dtype)
-            gate_inputs.append(neutral_prob)
-        return torch.cat(gate_inputs, dim=-1)
-
-    def domain_gated_scores(self, mask_outputs, state_outputs=None, memory_outputs=None, neutral_prob=None):
+    def domain_gated_scores(self, mask_outputs):
         anchors = self.get_domain_mapped_anchors()
         domain_features = []
         for adapter in self.domain_adapters:
@@ -259,65 +103,18 @@ class CLModel(nn.Module):
             domain_features.unsqueeze(2),
             anchors.transpose(0, 1).unsqueeze(0)
         )
-        domain_logits = (domain_scores / self.args.temp).clamp(min=-50.0, max=50.0)
+        domain_logits = domain_scores / self.args.temp
         domain_probs = F.softmax(domain_logits, dim=-1)
-        gate_input = self._domain_gate_input(mask_outputs, state_outputs, memory_outputs, neutral_prob)
-        gate_logits = self.domain_gate(gate_input).clamp(min=-50.0, max=50.0)
-        domain_weights = F.softmax(gate_logits, dim=-1)
+        domain_weights = F.softmax(self.domain_gate(mask_outputs), dim=-1)
         fused_probs = (domain_weights.unsqueeze(-1) * domain_probs).sum(dim=1)
-        fused_probs = fused_probs.clamp(min=self.eps, max=1.0)
-        fused_probs = fused_probs / fused_probs.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        self.last_gate_entropy = -(domain_weights * torch.log(domain_weights + self.eps)).sum(dim=-1).mean()
         self.last_emo_anchor = anchors
         self.last_domain_probs = domain_probs.detach()
         self.last_domain_weights = domain_weights.detach()
         return torch.log(fused_probs + self.eps), domain_features.mean(dim=1), anchors
 
-    def _expand_non_neutral_scores(self, non_neutral_logits, neutral_prob):
-        p_emo = F.softmax(non_neutral_logits, dim=-1)
-        neutral_prob = neutral_prob.clamp(min=self.eps, max=1.0 - self.eps)
-        final_probs = torch.zeros(
-            non_neutral_logits.shape[0],
-            self.num_classes,
-            device=non_neutral_logits.device,
-            dtype=non_neutral_logits.dtype,
-        )
-        final_probs[:, self.neutral_id] = neutral_prob.squeeze(-1)
-        final_probs[:, self.non_neutral_to_original] = (1.0 - neutral_prob) * p_emo
-        final_probs = final_probs.clamp(min=self.eps, max=1.0)
-        final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        return torch.log(final_probs + self.eps), final_probs, p_emo
-
-    def _classifier_logits(self, fused_outputs):
-        feature = torch.dropout(fused_outputs, self.dropout, train=self.training)
-        return self.predictor(feature)
-
-    def _fuse_logits(self, classifier_logits, prototype_logits, fused_outputs=None, neutral_prob=None):
-        if not self.use_classifier_prototype_fusion:
-            self.last_fusion_alpha = None
-            return prototype_logits
-        if self.fusion_type == "adaptive" and fused_outputs is not None:
-            cls_conf = F.softmax(classifier_logits, dim=-1).max(dim=-1, keepdim=True)[0]
-            proto_conf = F.softmax(prototype_logits, dim=-1).max(dim=-1, keepdim=True)[0]
-            if neutral_prob is None:
-                neutral_prob = torch.zeros_like(cls_conf)
-            elif neutral_prob.dim() == 1:
-                neutral_prob = neutral_prob.unsqueeze(-1)
-            fusion_input = torch.cat([fused_outputs, cls_conf, proto_conf, neutral_prob], dim=-1)
-            alpha = self.fusion_gate(fusion_input).clamp(min=0.0, max=1.0)
-        else:
-            alpha = classifier_logits.new_full((classifier_logits.shape[0], 1), min(max(self.fusion_alpha, 0.0), 1.0))
-        self.last_fusion_alpha = alpha.detach()
-        return alpha * classifier_logits + (1.0 - alpha) * prototype_logits
-
     @torch.no_grad()
     def update_anchors(self, raw_outputs, labels):
         if self.args.disable_anchor_updates:
-            return
-        if getattr(self, "prototype_updates_stopped", False):
-            return
-        freeze_epochs = getattr(self.args, "freeze_prototype_epochs", 0)
-        if getattr(self, "current_epoch", 0) < freeze_epochs:
             return
         valid_mask = labels >= 0
         if valid_mask.sum().item() == 0:
@@ -325,12 +122,6 @@ class CLModel(nn.Module):
 
         raw_outputs = raw_outputs[valid_mask].detach()
         labels = labels[valid_mask].detach()
-        if self.use_neutral_decoupling:
-            non_neutral_mask = labels != self.neutral_id
-            if non_neutral_mask.sum().item() == 0:
-                return
-            raw_outputs = raw_outputs[non_neutral_mask]
-            labels = labels[non_neutral_mask]
         mapped_outputs = self.map_function(raw_outputs).detach()
         mapped_anchors = self.get_mapped_anchors().detach()
 
@@ -340,25 +131,18 @@ class CLModel(nn.Module):
             class_mapped = mapped_outputs[class_mask]
             if class_raw.shape[0] == 0:
                 continue
-            anchor_class_id = self.original_to_non_neutral[class_id].item() if self.use_neutral_decoupling else class_id
-            if anchor_class_id < 0:
-                continue
-            sims = self.score_func(class_mapped.unsqueeze(1), mapped_anchors[anchor_class_id].unsqueeze(0))
+            sims = self.score_func(class_mapped.unsqueeze(1), mapped_anchors[class_id].unsqueeze(0))
             assignments = sims.argmax(dim=-1)
             for subanchor_id in range(self.num_subanchors):
                 member_mask = assignments == subanchor_id
                 if member_mask.sum().item() == 0:
                     continue
                 centroid = class_raw[member_mask].mean(dim=0)
-                new_anchor = (
-                    self.emo_anchor[class_id, subanchor_id] * self.args.prototype_momentum
-                    + centroid * (1.0 - self.args.prototype_momentum)
+                self.emo_anchor[class_id, subanchor_id].mul_(self.args.prototype_momentum).add_(
+                    centroid * (1.0 - self.args.prototype_momentum)
                 )
-                if getattr(self.args, "normalize_prototypes_after_update", False):
-                    new_anchor = F.normalize(new_anchor, dim=-1)
-                self.emo_anchor[class_id, subanchor_id].copy_(new_anchor)
     
-    def _forward(self, sentences, state_input_ids=None, state_attention_mask=None, memory_input_ids=None, memory_attention_mask=None):
+    def _forward(self, sentences):
         mask = 1 - (sentences == (self.pad_value)).long()
 
         utterance_encoded = self.f_context_encoder(
@@ -369,76 +153,13 @@ class CLModel(nn.Module):
         )['last_hidden_state']
         mask_pos = (sentences == (self.mask_value)).long().max(1)[1]
         mask_outputs = utterance_encoded[torch.arange(mask_pos.shape[0]), mask_pos]
-        state_outputs = self.encode_speaker_state(state_input_ids, state_attention_mask)
-        memory_outputs = self.encode_speaker_memory(memory_input_ids, memory_attention_mask)
-        fused_outputs = self.fuse_speaker_state(mask_outputs, state_outputs)
-        fused_outputs = self.fuse_speaker_memory(fused_outputs, memory_outputs)
-        neutral_logit = self.neutral_classifier(fused_outputs).squeeze(-1)
-        neutral_prob = torch.sigmoid(neutral_logit).unsqueeze(-1)
-        self.last_forward_output = {
-            "neutral_logit": neutral_logit,
-            "neutral_prob": neutral_prob,
-            "state_outputs": state_outputs,
-            "memory_outputs": memory_outputs,
-            "fused_outputs": fused_outputs,
-        }
-        if self.use_neutral_decoupling:
-            classifier_logits = self._classifier_logits(fused_outputs)
-            non_neutral_classifier_logits = classifier_logits[:, self.non_neutral_to_original]
-            if self.args.prototype_pooling == "domain_gated":
-                prototype_logits, mask_mapped_outputs, _ = self.domain_gated_scores(
-                    fused_outputs,
-                    state_outputs=state_outputs,
-                    memory_outputs=memory_outputs,
-                    neutral_prob=neutral_prob,
-                )
-            else:
-                mask_mapped_outputs = self.map_function(fused_outputs)
-                anchors = self.get_mapped_anchors()
-                self.last_emo_anchor = anchors
-                subanchor_scores = self.score_func(
-                    mask_mapped_outputs.unsqueeze(1).unsqueeze(2),
-                    anchors.unsqueeze(0)
-                )
-                prototype_logits = self.aggregate_subanchors(subanchor_scores)
-            non_neutral_logits = self._fuse_logits(non_neutral_classifier_logits, prototype_logits, fused_outputs, neutral_prob)
-            feature, final_probs, non_neutral_probs = self._expand_non_neutral_scores(non_neutral_logits, neutral_prob)
-            anchor_scores = feature if self.args.use_nearest_neighbour else None
-            self.last_forward_output.update({
-                "logits": feature,
-                "probs": final_probs,
-                "classifier_logits": classifier_logits,
-                "prototype_logits": prototype_logits,
-                "non_neutral_logits": non_neutral_logits,
-                "non_neutral_probs": non_neutral_probs,
-                "mask_mapped_outputs": mask_mapped_outputs,
-                "raw_outputs": mask_outputs,
-                "anchor_scores": anchor_scores,
-            })
-            return feature, mask_mapped_outputs, mask_outputs, anchor_scores
         if self.args.prototype_pooling == "domain_gated":
-            prototype_logits, mask_mapped_outputs, _ = self.domain_gated_scores(
-                fused_outputs,
-                state_outputs=state_outputs,
-                memory_outputs=memory_outputs,
-                neutral_prob=neutral_prob if self.use_neutral_decoupling else None,
-            )
-            classifier_logits = self._classifier_logits(fused_outputs)
-            feature = self._fuse_logits(classifier_logits, prototype_logits, fused_outputs, neutral_prob)
+            feature, mask_mapped_outputs, _ = self.domain_gated_scores(mask_outputs)
             anchor_scores = feature if self.args.use_nearest_neighbour else None
-            self.last_forward_output.update({
-                "logits": feature,
-                "classifier_logits": classifier_logits,
-                "prototype_logits": prototype_logits,
-                "mask_mapped_outputs": mask_mapped_outputs,
-                "raw_outputs": mask_outputs,
-                "anchor_scores": anchor_scores,
-            })
             return feature, mask_mapped_outputs, mask_outputs, anchor_scores
-        mask_mapped_outputs = self.map_function(fused_outputs)
-        classifier_logits = self._classifier_logits(fused_outputs)
-        feature = classifier_logits
-        prototype_logits = None
+        mask_mapped_outputs = self.map_function(mask_outputs)
+        feature = torch.dropout(mask_outputs, self.dropout, train=self.training)
+        feature = self.predictor(feature)
         if self.args.use_nearest_neighbour:
             anchors = self.get_mapped_anchors()
             self.last_emo_anchor = anchors
@@ -446,37 +167,19 @@ class CLModel(nn.Module):
                 mask_mapped_outputs.unsqueeze(1).unsqueeze(2),
                 anchors.unsqueeze(0)
             )
-            prototype_logits = self.aggregate_subanchors(subanchor_scores)
-            anchor_scores = prototype_logits
+            anchor_scores = self.aggregate_subanchors(subanchor_scores)
             if self.args.prototype_pooling == "entropy":
-                feature = prototype_logits
-            if self.use_classifier_prototype_fusion:
-                feature = self._fuse_logits(classifier_logits, prototype_logits, fused_outputs, neutral_prob)
-                anchor_scores = feature
+                feature = anchor_scores
             
         else:
             anchor_scores = None
-        self.last_forward_output.update({
-            "logits": feature,
-            "classifier_logits": classifier_logits,
-            "prototype_logits": prototype_logits,
-            "mask_mapped_outputs": mask_mapped_outputs,
-            "raw_outputs": mask_outputs,
-            "anchor_scores": anchor_scores,
-        })
         return feature, mask_mapped_outputs, mask_outputs, anchor_scores
     
-    def forward(self, sentences, state_input_ids=None, state_attention_mask=None, memory_input_ids=None, memory_attention_mask=None, return_mask_output=False):
+    def forward(self, sentences, return_mask_output=False):
         '''
         generate vector representations for each turn of conversation
         '''
-        feature, mask_mapped_outputs, mask_outputs, anchor_scores = self._forward(
-            sentences,
-            state_input_ids=state_input_ids,
-            state_attention_mask=state_attention_mask,
-            memory_input_ids=memory_input_ids,
-            memory_attention_mask=memory_attention_mask,
-        )
+        feature, mask_mapped_outputs, mask_outputs, anchor_scores = self._forward(sentences)
         
         if return_mask_output:
             return feature, mask_mapped_outputs, mask_outputs, anchor_scores

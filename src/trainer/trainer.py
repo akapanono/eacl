@@ -5,39 +5,15 @@ import torch.distributed as dist
 from sklearn.metrics import f1_score, accuracy_score
 from tqdm import tqdm
 
-def check_model_parameters(model):
-    for name, param in model.named_parameters():
-        if param is not None and not torch.isfinite(param).all():
-            raise ValueError(f"Parameter {name} contains NaN or Inf.")
-    for name, buffer in model.named_buffers():
-        if buffer is not None and torch.is_floating_point(buffer) and not torch.isfinite(buffer).all():
-            raise ValueError(f"Buffer {name} contains NaN or Inf.")
-
-def unpack_batch(batch):
-    if len(batch) >= 6:
-        input_ids, label, state_input_ids, state_attention_mask, memory_input_ids, memory_attention_mask = batch[:6]
-        return input_ids, label, state_input_ids, state_attention_mask, memory_input_ids, memory_attention_mask
-    if len(batch) >= 4:
-        input_ids, label, state_input_ids, state_attention_mask = batch[:4]
-        return input_ids, label, state_input_ids, state_attention_mask, None, None
-    input_ids, label = batch
-    return input_ids, label, None, None, None, None
-
 def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, optimizer=None, lr_scheduler=None, train=False):
     losses, preds, labels = [], [], []
     sentiment_representations, sentiment_labels = [], []
-    fusion_alphas = []
-    component_losses = {
-        "ce": [], "cl": [], "task": [], "neutral": [], "supcon": [], "angle": [], "sas": [], "hard": [], "gate_entropy": []
-    }
 
     assert not train or optimizer != None
     if train:
         model.train()
     else:
         model.eval()
-    if hasattr(model, "current_epoch"):
-        model.current_epoch = epoch
     if args.disable_training_progress_bar:
         pbar = dataloader
     else:
@@ -45,31 +21,16 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
     
     for batch_id, batch in enumerate(pbar):
         
-        input_ids, label, state_input_ids, state_attention_mask, memory_input_ids, memory_attention_mask = unpack_batch(batch)
+        input_ids, label = batch
        
         input_orig = input_ids
         input_aug = None
 
         if args.fp16:
             with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                loss, loss_output, log_prob, label, mask, anchor_scores = _forward(
-                    model, loss_function, input_orig, input_aug, label, device,
-                    state_input_ids=state_input_ids,
-                    state_attention_mask=state_attention_mask,
-                    memory_input_ids=memory_input_ids,
-                    memory_attention_mask=memory_attention_mask,
-                )
+                loss, loss_output, log_prob, label, mask, anchor_scores = _forward(model, loss_function, input_orig, input_aug, label, device)
         else:
-            loss, loss_output, log_prob, label, mask, anchor_scores = _forward(
-                model, loss_function, input_orig, input_aug, label, device,
-                state_input_ids=state_input_ids,
-                state_attention_mask=state_attention_mask,
-                memory_input_ids=memory_input_ids,
-                memory_attention_mask=memory_attention_mask,
-            )
-
-        if not torch.isfinite(loss).all():
-            raise ValueError(f"Non-finite loss at epoch={epoch + 1}, batch={batch_id}: {loss.detach().cpu()}")
+            loss, loss_output, log_prob, label, mask, anchor_scores = _forward(model, loss_function, input_orig, input_aug, label, device)
 
         if args.use_nearest_neighbour:
             pred = torch.argmax(anchor_scores[mask], dim=-1)
@@ -78,32 +39,15 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
 
         preds.append(pred)
         labels.append(label)
-        if hasattr(model, "last_fusion_alpha") and model.last_fusion_alpha is not None:
-            fusion_alphas.append(model.last_fusion_alpha[mask].detach().cpu())
         losses.append(loss.item())
-        component_losses["ce"].append(loss_output.ce_loss.item())
-        component_losses["cl"].append(loss_output.cl_loss.item())
-        component_losses["task"].append(loss_output.task_loss.item())
-        component_losses["neutral"].append(loss_output.neutral_loss.item())
-        component_losses["supcon"].append(loss_output.supcon_loss.item())
-        component_losses["angle"].append(loss_output.angle_loss.item())
-        component_losses["sas"].append(loss_output.sas_loss.item())
-        component_losses["hard"].append(loss_output.hard_loss.item())
-        component_losses["gate_entropy"].append(loss_output.gate_entropy.item())
 
         if train:
-            accumulation_step = max(1, int(getattr(args, "accumulation_step", 1)))
-            (loss / accumulation_step).backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2)
-            if not torch.isfinite(grad_norm):
-                raise ValueError(f"Non-finite gradient norm at epoch={epoch + 1}, batch={batch_id}: {grad_norm}")
-            should_step = ((batch_id + 1) % accumulation_step == 0) or ((batch_id + 1) == len(dataloader))
-            if should_step:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2)
+            if batch_id % args.accumulation_step == 0:
                 optimizer.step()
                 if lr_scheduler is not None and getattr(args, "lr_scheduler", "step") != "step":
                     lr_scheduler.step()
-                if getattr(args, "debug_finite_checks", False):
-                    check_model_parameters(model)
                 optimizer.zero_grad()
         else:
             sentiment_representations.append(loss_output.sentiment_representations)
@@ -117,7 +61,7 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
                     new_labels.append(l.cpu().item())
                     new_preds.append(preds[i][j].cpu().item())
     else:
-        return float('nan'), float('nan'), [], [], float('nan'), [], [], {}
+        return float('nan'), float('nan'), [], [], float('nan'), [], [], [], [], []
 
     avg_loss = round(np.sum(losses) / len(losses), 4)
     avg_accuracy = round(accuracy_score(new_labels, new_preds) * 100, 2)
@@ -125,10 +69,6 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
     max_cosine = loss_output.max_cosine
 
     avg_fscore = round(f1_score(new_labels, new_preds, average='weighted') * 100, 2)
-    stats = {
-        f"loss_{name}": round(float(np.mean(values)), 4) if values else 0.0
-        for name, values in component_losses.items()
-    }
 
     f1_scores = []
 
@@ -156,91 +96,26 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, args, o
                     true_label.append(1)
                 else:
                     true_label.append(0)
-        f1 = round(f1_score(true_label, pred_label, zero_division=0) * 100, 2)
+        f1 = round(f1_score(true_label, pred_label) * 100, 2)
         f1_scores.append(f1)
 
-    if hasattr(model, "neutral_id") and model.neutral_id is not None:
-        neutral_true = (new_labels == model.neutral_id).astype(int)
-        neutral_pred = (new_preds == model.neutral_id).astype(int)
-        stats["neutral_f1"] = round(f1_score(neutral_true, neutral_pred, zero_division=0) * 100, 2)
-        non_neutral_ids = [idx for idx in range(n) if idx != model.neutral_id]
-        stats["non_neutral_macro_f1"] = round(
-            f1_score(new_labels, new_preds, labels=non_neutral_ids, average="macro", zero_division=0) * 100,
-            2,
-        )
-    if hasattr(model, "last_domain_weights"):
-        stats["avg_domain_weight"] = [
-            round(item, 4) for item in model.last_domain_weights.float().mean(dim=0).detach().cpu().tolist()
-        ]
-    if hasattr(model, "last_fusion_alpha") and model.last_fusion_alpha is not None:
-        stats["avg_fusion_alpha"] = round(float(model.last_fusion_alpha.float().mean().detach().cpu().item()), 4)
-    if fusion_alphas:
-        alpha_values = torch.cat(fusion_alphas).float().numpy()
-        usable = min(len(alpha_values), len(new_labels))
-        if usable > 0:
-            alpha_values = alpha_values[:usable]
-            stats["avg_alpha"] = round(float(np.mean(alpha_values)), 4)
-            correct_mask = new_labels[:usable] == new_preds[:usable]
-            if correct_mask.any():
-                stats["alpha_correct"] = round(float(np.mean(alpha_values[correct_mask])), 4)
-            if (~correct_mask).any():
-                stats["alpha_wrong"] = round(float(np.mean(alpha_values[~correct_mask])), 4)
-            stats["alpha_by_class"] = [
-                round(float(np.mean(alpha_values[new_labels[:usable] == class_id])), 4)
-                if (new_labels[:usable] == class_id).any() else None
-                for class_id in range(n)
-            ]
-
-    return avg_loss, avg_accuracy, labels, preds, avg_fscore, f1_scores, max_cosine, stats
+    return avg_loss, avg_accuracy, labels, preds, avg_fscore, f1_scores, max_cosine
 
 
-def _forward(
-    model,
-    loss_function,
-    input_orig,
-    input_aug,
-    label,
-    device,
-    state_input_ids=None,
-    state_attention_mask=None,
-    memory_input_ids=None,
-    memory_attention_mask=None,
-):
+def _forward(model, loss_function, input_orig, input_aug, label, device):
 
     input_ids = input_orig.to(device)
     label = label.to(device)
-    if state_input_ids is not None:
-        state_input_ids = state_input_ids.to(device)
-    if state_attention_mask is not None:
-        state_attention_mask = state_attention_mask.to(device)
-    if memory_input_ids is not None:
-        memory_input_ids = memory_input_ids.to(device)
-    if memory_attention_mask is not None:
-        memory_attention_mask = memory_attention_mask.to(device)
     mask = torch.ones(len(input_orig)).to(device)
     mask = mask > 0.5
     if model.training:
-        log_prob, masked_mapped_output, masked_output, anchor_scores = model(
-            input_ids,
-            state_input_ids=state_input_ids,
-            state_attention_mask=state_attention_mask,
-            memory_input_ids=memory_input_ids,
-            memory_attention_mask=memory_attention_mask,
-            return_mask_output=True,
-        ) 
+        log_prob, masked_mapped_output, masked_output, anchor_scores = model(input_ids, return_mask_output=True) 
         loss_output = loss_function(log_prob, masked_mapped_output, masked_output, label, mask, model)
     else:
         with torch.no_grad():
-            log_prob, masked_mapped_output, masked_output, anchor_scores = model(
-                input_ids,
-                state_input_ids=state_input_ids,
-                state_attention_mask=state_attention_mask,
-                memory_input_ids=memory_input_ids,
-                memory_attention_mask=memory_attention_mask,
-                return_mask_output=True,
-            ) 
+            log_prob, masked_mapped_output, masked_output, anchor_scores = model(input_ids, return_mask_output=True) 
             loss_output = loss_function(log_prob, masked_mapped_output, masked_output, label, mask, model)
-    loss = loss_output.total_loss
+    loss = loss_output.ce_loss * model.args.ce_loss_weight + (1 - model.args.ce_loss_weight) * loss_output.cl_loss
 
     return loss, loss_output, log_prob, label[mask], mask, anchor_scores
 
@@ -258,8 +133,6 @@ def retrain(model, loss_function, dataloader, epoch, device, args, optimizer=Non
             log_prob = model(data)
         
         loss = loss_function(log_prob, label)
-        if not torch.isfinite(loss).all():
-            raise ValueError(f"Non-finite stage-2 loss at epoch={epoch + 1}: {loss.detach().cpu()}")
         losses.append(loss.item())
         ce_losses.append(loss.item())
         pred = torch.argmax(log_prob, dim = -1)
@@ -267,9 +140,7 @@ def retrain(model, loss_function, dataloader, epoch, device, args, optimizer=Non
         labels.append(label)
         if train:
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2)
-            if not torch.isfinite(grad_norm):
-                raise ValueError(f"Non-finite stage-2 gradient norm at epoch={epoch + 1}: {grad_norm}")
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2)
             optimizer.step()
             optimizer.zero_grad()
     if len(preds) != 0:
@@ -314,7 +185,7 @@ def retrain(model, loss_function, dataloader, epoch, device, args, optimizer=Non
                     true_label.append(1)
                 else:
                     true_label.append(0)
-        f1 = round(f1_score(true_label, pred_label, zero_division=0) * 100, 2)
+        f1 = round(f1_score(true_label, pred_label) * 100, 2)
         f1_scores.append(f1)
     # list(precision_recall_fscore_support(y_true=new_labels, y_pred=new_preds)[2])
 
